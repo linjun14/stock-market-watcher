@@ -2,6 +2,12 @@
 
 This skill turns natural-language prompts about brands and market trends into persistent stock snapshots in the database, then creates a concise Markdown report so users can understand a brand without searching across multiple websites and URLs.
 
+## Why this Skill Exists
+
+This skill is a workflow, not just a one-step prompt. A single AI chat can give a current price, but it does not automatically store the data, compare it with earlier snapshots, or build a reusable market summary. This skill handles those intermediate steps: identifying the brand and ticker, fetching the right sources, parsing the data, saving snapshots, and comparing changes over time.
+
+That makes it useful for ongoing market tracking rather than a one-off answer.
+
 ## Who it is for
 
 Students can learn how a Codex-compatible skill works by following this skill’s workflow and seeing how persistent state, browser lookups, and Markdown report generation each contribute to the final result.
@@ -66,13 +72,7 @@ python -c "import playwright; print('Playwright is installed')"
 
 ## End-to-End Workflows
 
-### Track a Brand and Review Market Trends
-
-Example user input:
-
-> Summarize Google's market trends from 2026-01-01 to 2026-06-01.
-
-The workflow:
+The general workflow is as follows:
 
 1. Parse the natural-language request to identify the brand, requested date range, and whether a comparison with previous snapshots is needed. If no date range is provided, use the last month.
 2. Map the brand name to its standardized stock ticker symbol (for example, Google to GOOG).
@@ -82,6 +82,16 @@ The workflow:
 6. Store the brand, ticker, source information, and point-in-time price observations in the local SQLite database. Append new observations to the existing history rather than replacing earlier snapshots.
 7. When previous snapshots are available or the request asks for a review, compare the latest prices and calculated changes with prior observations and flag notable movements (for example, changes over 3%).
 8. Write a formatted Markdown report with the sources, price trends, metrics, relevant news, and any comparison findings, then display the report in chat.
+
+## What the package actually does
+
+This skill package mainly does a few core things:
+
+- Stores stock sources and market snapshots in a local database.
+- Runs the scripts needed to fetch and process market data.
+- Parses prices and related information from public sources and the web.
+- Compares new data with previous snapshots and highlights meaningful changes.
+- Writes a concise Markdown report with the findings.
 
 ## What this Skill does not do
 
