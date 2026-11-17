@@ -1,0 +1,4 @@
+interface:
+  display_name: "Stock Market Watcher"
+  short_description: "Track stock prices, trends, and market news"
+  default_prompt: "Track [company] stock: retrieve the available public price and relevant market news during the last month, save a timestamped snapshot, and write a Markdown report with sources."
