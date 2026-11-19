@@ -2,8 +2,14 @@
 
 # Standard-library modules for the CLI, SQLite storage, and filesystem paths.
 import argparse
+from datetime import datetime, timezone
+import json
 import sqlite3
+import sys
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 
 # Keep runtime files beside the repository, regardless of the caller's cwd.
@@ -85,12 +91,90 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Initialize and run the stock market watcher."
     )
-    parser.add_argument(
-        "command",
-        choices=("init",),
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser(
+        "init",
         help="initialize the .state and reports directories",
     )
+    price_parser = commands.add_parser(
+        "price",
+        help="fetch the latest available stock price for a brand or company",
+    )
+    price_parser.add_argument(
+        "--brand",
+        required=True,
+        help="company or brand name (or stock ticker)",
+    )
     return parser
+
+
+def fetch_json(url: str) -> dict:
+    """Fetch a JSON response from a public market-data endpoint."""
+    request = Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; StockMarketWatcher/1.0)"},
+    )
+    try:
+        with urlopen(request, timeout=15) as response:
+            return json.load(response)
+    except HTTPError as error:
+        raise RuntimeError(f"Market data request failed (HTTP {error.code}).") from error
+    except URLError as error:
+        raise RuntimeError(
+            f"Could not reach the market data service: {error.reason}"
+        ) from error
+    except json.JSONDecodeError as error:
+        raise RuntimeError("The market data service returned invalid JSON.") from error
+
+
+def fetch_latest_price(brand: str) -> str:
+    """Resolve a brand to a ticker and format its latest reported quote."""
+    search_url = "https://query1.finance.yahoo.com/v1/finance/search?" + urlencode(
+        {"q": brand, "quotesCount": 10, "newsCount": 0}
+    )
+    search_data = fetch_json(search_url)
+    quotes = search_data.get("quotes", [])
+    equity_matches = [
+        quote
+        for quote in quotes
+        if quote.get("quoteType") == "EQUITY" and quote.get("symbol")
+    ]
+    if not equity_matches:
+        raise ValueError(f"No publicly traded stock was found for {brand!r}.")
+
+    match = equity_matches[0]
+    ticker = match["symbol"]
+    chart_url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?"
+        + urlencode({"range": "1d", "interval": "1m"})
+    )
+    chart_data = fetch_json(chart_url)
+    chart = chart_data.get("chart", {})
+    if chart.get("error"):
+        raise ValueError(f"Could not retrieve a quote for {ticker}.")
+    results = chart.get("result") or []
+    if not results:
+        raise ValueError(f"No latest quote is available for {ticker}.")
+
+    metadata = results[0].get("meta", {})
+    price = metadata.get("regularMarketPrice")
+    observed_at = metadata.get("regularMarketTime")
+    if not isinstance(price, (int, float)) or not isinstance(observed_at, (int, float)):
+        raise ValueError(f"The latest quote for {ticker} is incomplete.")
+
+    precision = metadata.get("priceHint", 2)
+    if not isinstance(precision, int) or not 0 <= precision <= 8:
+        precision = 2
+    price_text = f"{price:,.{precision}f}"
+    timestamp = datetime.fromtimestamp(observed_at, timezone.utc).strftime(
+        "%Y-%m-%d %H:%M UTC"
+    )
+    company = metadata.get("longName") or metadata.get("shortName") or brand
+    currency = metadata.get("currency") or "unknown currency"
+    return (
+        f"{company} ({ticker}): {price_text} {currency} "
+        f"(latest reported {timestamp}; source: Yahoo Finance)"
+    )
 
 
 def main() -> int:
@@ -105,8 +189,15 @@ def main() -> int:
         print(f"Initialized SQLite database at {database_path}")
         return 0
 
-    # Argparse currently limits commands to init; keep a successful exit fallback.
-    return 0
+    if args.command == "price":
+        try:
+            print(fetch_latest_price(args.brand))
+        except (RuntimeError, ValueError, OSError) as error:
+            print(f"Error: {error}", file=sys.stderr)
+            return 1
+        return 0
+
+    return 2
 
 
 # Run the CLI only when this file is executed directly, not when imported.

@@ -1,20 +1,24 @@
 ---
 name: stock-market-watcher
-description: Fetch public stock prices and market news by brand name, persist timestamped snapshots in local SQLite, compare historical price deltas, and generate Markdown trend reports. Users can also compare two snapshots of the same brand to see how the stock changed over time. Use when the user asks to track a company's stock, summarize market trends, or check price changes.
+description: Use only when the user explicitly asks about a named company's public stock price, stock performance or trend, historical stock-price comparison, or stock monitoring. Extract the company or ticker from the request; do not activate for unrelated requests that merely mention a company, brand, or market.
 ---
 
 # Stock Market Watcher
 
-This skill finds a brand or company by name, parses it to the relevant market entity, and fetches its current market value and recent market context. It can also summarize the brand’s stock trend and overall market position without requiring the user to manually search multiple sources or URLs.
+This skill tracks a publicly traded company by name or ticker, records a timestamped price snapshot in local SQLite, and compares it with earlier observations to explain how the stock moved over time. It fetches the latest market value, keeps source metadata, and can turn the result into a brief Markdown trend summary for the user.
 
 ## Overview
 
-Trigger this skill when a user wants to find the current stock value of a brand or company, understand what has happened to a stock recently, compare market performance across two snapshots or time points, or stay aware of significant price changes and market events. It is especially useful for quick investment insights, brand-level market tracking, and summarizing stock movement without manually researching multiple sources.
+Trigger this skill only when the user explicitly asks for public stock-price information or stock performance: for example, a current quote, a stock trend, a comparison between dates or saved snapshots, or monitoring price changes. A company or brand name alone is not a trigger. Do not trigger for general company/brand research, product questions, writing or coding tasks, broad market discussion without a requested stock lookup, or incidental company mentions.
 
-Do not trigger this skill for non-financial questions, requests to perform trades, general company research unrelated to market performance, speculative investment advice beyond factual market summaries, or requests that require detailed legal, accounting, or personalized financial guidance.
+## Request Interpretation
+
+When the trigger criteria are met, read the user's message and extract the company or ticker they are asking about. Preserve the requested company name, and resolve it to a ticker using a public market-data source rather than guessing. If multiple companies or tickers are plausible, ask which one they mean before fetching data. Extract date ranges or comparison points only when requested; otherwise follow the workflow's stated default. Do not treat quoted text, examples, or incidental company names as the requested subject.
+
+Do not use this skill for non-financial questions, requests to perform trades, speculative investment advice, or requests that require detailed legal, accounting, or personalized financial guidance.
 
 ## Prerequisites & Environment
-- Expected working directory for the skill: /skills/stock-market-watcher. In this workspace, the repository root is /workspaces/stock-market-watcher, so the same relative paths apply there.
+- Expected working directory for the skill: skills/stock-market-watcher
 - Required runtime: Python 3.10+; use the Python standard library modules `sqlite3`, `argparse`, `json`, and `pathlib` without installing additional packages for basic persistence and file handling.
 - Browser/data-fetch dependency: install `playwright` and a Chromium runtime for public market-page and news lookups (`python -m pip install playwright` and `python -m playwright install chromium`).
 - Local SQLite state path: /skills/stock-market-watcher/.state/stock_market_watcher.db. This database is intentionally untracked in git and should be treated as local runtime state only.
@@ -23,7 +27,7 @@ Do not trigger this skill for non-financial questions, requests to perform trade
 
 ## Workflows & Execution Steps
 
-Run these workflows from the skill's working directory (the repository root in this workspace). The steps below describe the intended process; the files under `scripts/` are placeholders, not runnable implementations.
+Run these workflows from the skill's working directory (skills/stock-market-watcher). The steps below describe the intended process; the files under `scripts/` are placeholders, not runnable implementations.
 
 ### Fetch and save a stock snapshot
 

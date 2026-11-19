@@ -1,6 +1,6 @@
-# Stock Market watcher
+# Stock Market Watcher
 
-This skill turns natural-language prompts about brands and market trends into persistent stock snapshots in the database, then creates a concise Markdown report so users can understand a brand without searching across multiple websites and URLs.
+This skill handles explicit requests about a named company's public stock price or performance. It identifies the requested company or ticker, records timestamped stock snapshots in the database, and can create a concise Markdown report. A company or brand mention by itself does not activate the skill.
 
 ## Why this Skill Exists
 
@@ -101,4 +101,3 @@ This skill package does not:
 - Send private search queries, financial histories, or tracking profiles to third-party services. Public-source requests should include only the information needed to retrieve the requested market data or news.
 - Scrape websites or make unauthorized writes to external services. Prefer public market-data sources and use only access methods permitted by the source.
 - Bypass paywalls, rate limits, authentication, or other access controls on restricted financial services.
-- Perform a ticker lookup or data-fetch failure for one brand should be recorded and reported without stopping the rest of a batch when other symbols can still be processed.
