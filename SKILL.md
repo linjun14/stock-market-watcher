@@ -27,28 +27,29 @@ Do not use this skill for non-financial questions, requests to perform trades, s
 
 ## Workflows & Execution Steps
 
-Run these workflows from the skill's working directory (skills/stock-market-watcher). The steps below describe the intended process; the files under `scripts/` are placeholders, not runnable implementations.
+Run the CLI from the skill's root directory. Historical prices are fetched from Yahoo Finance and saved as dated observations; the command prints a concise result for the Codex conversation and writes a Markdown report under `reports/`.
 
 ### Fetch and save a stock snapshot
 
 Trigger this workflow when the user asks for a company's current stock value, recent market context, or ongoing tracking that needs a new point-in-time observation.
 
 1. Identify the company and ticker from the request. If the ticker or source is uncertain, verify it with a public market-data source; consult `references/` for source guidance if it is populated.
-2. Use the browser/data-fetch capability described in the prerequisites to retrieve the latest available price, timestamp, and relevant market news. Record the sources used.
-3. Create `.state/` if needed and append the timestamped observation, company/ticker, and source details to `.state/stock_market_watcher.db`; do not replace earlier observations.
-4. Compare the new observation with the previous snapshot, if one exists, and note any significant movement.
-5. Write a concise Markdown summary to `reports/`, creating that directory if needed, and present the result and sources to the user.
+2. Extract the requested date range. If the user specifies a number of months, run `python3 scripts/stock_watcher.py price --brand "<brand>" --months <n>`. If they specify a start date, use `--fromdate YYYY-MM-DD`. If no range is specified, omit both options; the default is the last calendar month. The options cannot be combined.
+2. Use `--months <n>` for the number of calendar months to track (default: 1). `--fromdate YYYY-MM-DD` sets the range's end date (default: today); the start date is that many months before the end date. For example, `--months 3 --fromdate 2025-11-16` fetches the three months ending November 16, 2025.
+2. Use `--months <n>` for the number of calendar months to track (default: 1). `--fromdate YYYY-MM-DD` sets the range's end date (default: today); the start date is that many months before the end date. For example, `--months 3 --fromdate 2025-11-16` fetches the three months ending November 16, 2025.
+3. The command fetches daily closing prices within that range, appends each available observation to `.state/stock_market_watcher.db`, and writes a dated Markdown report with the requested and observed dates, price metrics, calculation results, and daily closes. Do not fetch or include related news in this report yet.
+4. Present the command's printed net-change result and report contents in the Codex conversation. State the actual observation dates, price currency, and Yahoo Finance as the source; identify the values as historical closing prices.
 
 ### Compare snapshots
 
-Trigger this workflow when the user asks how a company's stock changed between two snapshots or time points, or requests a comparison with an earlier observation.
+Trigger this workflow when the user asks how a company's stock changed over a date range or between two snapshots or time points.
 
-1. Identify the company/ticker and the two requested time points; if the user does not specify both, use the latest observation and the nearest earlier stored observation, and state which were selected.
-2. Read matching observations from `.state/stock_market_watcher.db`. If a requested observation is missing, fetch the needed historical data from a public source and save it before comparing.
-3. Calculate the absolute and percentage price change between the observations, retaining their timestamps and source details.
-4. Write the comparison and any relevant market context to a Markdown report in `reports/`, then present the result to the user.
+1. For a requested date range, follow the historical-price workflow above. For a comparison of saved snapshots, identify the requested points and use stored observations where available.
+2. If a requested stored observation is missing, fetch historical data from a public source and save it before comparing.
+3. Calculate absolute and percentage price change between the selected observations, retaining their dates and source details.
+4. Present the result and source to the user, and write a Markdown report in `reports/`.
 
-`README.md` contains the project overview and broader setup guidance. `references/` is reserved for static source guidance, `scripts/` for future runnable helpers, and `agents/openai.yaml` contains agent metadata; none of those placeholder/support files currently implements the workflows above.
+`README.md` contains the project overview and setup guidance. `scripts/stock_watcher.py` initializes the local database and fetches and stores historical closing prices with the `price` command. `references/` is reserved for static source guidance, and `agents/openai.yaml` contains agent metadata.
 
 ## SQLite Schema
 

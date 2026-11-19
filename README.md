@@ -25,7 +25,8 @@ It is especially useful for people who want to:
 - Extracts brand or company names and optional date ranges from natural-language prompts. If no date range is specified, it defaults to the last month.
 - Resolves brand names to public financial data sources and uses a browser to fetch live market pages.
 - Reports stock prices at a specific point in time, and fetches historical prices, trends, and related events.
-- Computes key performance metrics, including net price change and daily volatility, and provides insights into the brand's market health.
+- Reports historical closing prices and quantitative trends for a requested date range.
+- Computes net price change, percentage change, mean, extrema, and daily return volatility.
 - Stores point-in-time stock price observations in a local SQLite database.
 - Compares newly fetched prices with previous snapshots for the brand and flags brands with significant changes.
 - Compiles findings into structured Markdown summary reports.
@@ -35,40 +36,49 @@ It is especially useful for people who want to:
 
 ### Requirements
 
-- Python 3.x. Python 3.10 or newer is recommended.
-- The Python `playwright` package and a Playwright browser (Chromium) for browser-based lookups.
-- Internet access to visit public market-data and news sources. The sources themselves may require accounts, block automated browsing, or change their pages.
-- Write access to the project directory for the SQLite database and generated Markdown reports. Use the project-local `reports/` directory for reports; create it if it does not exist.
+- Python 3.10 or newer.
+- Internet access to retrieve quote data from Yahoo Finance.
+- Write access to the project directory for the SQLite database.
 
-Python's standard library includes `argparse` for command-line arguments, `sqlite3` for persistence, and `math`/`statistics` for common metric calculations. These do not need separate installation. The repository currently has no dependency manifest, and its scripts are not implemented yet, so additional packages may be required once their data sources and calculations are defined.
+The current command-line script uses only the Python standard library; no package installation is required.
 
 ### Setup
 
-From the repository root, create and activate a virtual environment, then install Playwright and its Chromium browser:
+From the repository root, initialize the local SQLite database:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install playwright
-python -m playwright install chromium
-mkdir -p reports
+python3 scripts/stock_watcher.py init
 ```
 
-On Windows, activate the environment with `.venv\Scripts\activate` in Command Prompt or `.venv\Scripts\Activate.ps1` in PowerShell. Create the reports directory with `mkdir reports`.
+The database is created at `.state/stock_market_watcher.db`; runtime data is excluded from git.
 
-On Linux, if the browser reports missing operating-system libraries, install the required browser dependencies with:
+### Fetch and store a price snapshot
+
+Fetch daily closing prices for the last calendar month (the default) and append them to the database:
+Fetch daily closing prices for the last calendar month ending today (the default) and append them to the database:
 
 ```bash
-python -m playwright install --with-deps chromium
+python3 scripts/stock_watcher.py price --brand "Microsoft"
 ```
 
-Check that Python and Playwright are available:
+Each successful `price` command stores the available daily closes in `snapshots`, linked to the company and Yahoo Finance source, with both the capture time and the market's observation time. Previous snapshots are retained. The command prints the net price and percentage change between the first and last available closes, and writes a Markdown summary in `reports/`. An internet connection is required.
+Each successful `price` command stores the available daily closes in `snapshots`, linked to the company and Yahoo Finance source, with both the capture time and the market's observation time. Previous snapshots are retained. The command prints the net price and percentage change between the first and last available closes, and writes a Markdown summary in `reports/` with date coverage, starting and ending closes, net and percentage change calculations, highest and lowest closes, mean close, daily return volatility, and a table of every retrieved close. The report is quantitative only; related news is not included yet. An internet connection is required.
+
+Choose a different lookback in calendar months:
+Choose a different lookback in calendar months; `--fromdate` can also set the range's end date:
 
 ```bash
-python --version
-python -c "import playwright; print('Playwright is installed')"
+python3 scripts/stock_watcher.py price --brand "Microsoft" --months 6
 ```
+
+Or provide an explicit start date in `YYYY-MM-DD` format; data is fetched from that date through today:
+For example, fetch the six months ending on the specified date:
+
+```bash
+python3 scripts/stock_watcher.py price --brand "Microsoft" --months 6 --fromdate 2025-11-16
+```
+
+`--fromdate` defaults to the current date and sets the range end; `--months` defaults to `1` and determines how far back to fetch. The month count must be a positive whole number. Reported net change uses the first and last available daily closing prices within the requested interval, which can differ from the exact boundary dates when markets are closed.
 
 ## End-to-End Workflows
 
@@ -77,11 +87,13 @@ The general workflow is as follows:
 1. Parse the natural-language request to identify the brand, requested date range, and whether a comparison with previous snapshots is needed. If no date range is provided, use the last month.
 2. Map the brand name to its standardized stock ticker symbol (for example, Google to GOOG).
 3. Select appropriate public market-data and news sources for the ticker, and save the sources with the watched brand so later updates can use them.
-4. Fetch historical prices for the requested period and relevant news about notable price changes.
+3. Select the public market-data source for the ticker.
+4. Fetch historical daily closing prices for the requested period.
 5. Calculate trend metrics such as net price change, percentage change, and daily volatility.
 6. Store the brand, ticker, source information, and point-in-time price observations in the local SQLite database. Append new observations to the existing history rather than replacing earlier snapshots.
 7. When previous snapshots are available or the request asks for a review, compare the latest prices and calculated changes with prior observations and flag notable movements (for example, changes over 3%).
 8. Write a formatted Markdown report with the sources, price trends, metrics, relevant news, and any comparison findings, then display the report in chat.
+8. Write and display a Markdown report containing the date range, quantitative metrics and calculations, and daily closing-price table. Do not include news yet.
 
 ## What the package actually does
 
