@@ -336,38 +336,60 @@ def normalize_news_item(item: dict) -> dict | None:
 
 
 def fetch_related_news(ticker: str, move_date: date) -> list[dict]:
-    """Fetch public news published near a significant move date."""
-    search_url = "https://query1.finance.yahoo.com/v1/finance/search?" + urlencode(
-        {
-            "q": f"{ticker} {move_date.isoformat()}",
-            "quotesCount": 0,
-            "newsCount": 10,
-        }
-    )
-    response = fetch_json(search_url)
-    news_items = response.get("news") or []
-    if not isinstance(news_items, list):
-        raise RuntimeError("Yahoo Finance returned an invalid news response.")
+    """Fetch and merge ticker and date-specific news near a significant move."""
+    search_url = "https://query1.finance.yahoo.com/v1/finance/search?"
     articles = []
     seen_urls = set()
-    for item in news_items:
-        if not isinstance(item, dict):
+    errors = []
+    queries = (f"{ticker} {move_date.isoformat()}", ticker)
+    for query in queries:
+        url = search_url + urlencode(
+            {"q": query, "quotesCount": 0, "newsCount": 25}
+        )
+        try:
+            response = fetch_json(url)
+        except RuntimeError as error:
+            errors.append(str(error))
             continue
-        article = normalize_news_item(item)
-        if article is None:
+        news_items = response.get("news") or []
+        if not isinstance(news_items, list):
+            errors.append("Yahoo Finance returned an invalid news response.")
             continue
-        if (
-            article["related_tickers"]
-            and ticker.upper() not in article["related_tickers"]
-        ):
-            continue
-        published_date = datetime.fromisoformat(article["published_at"]).date()
-        if abs((published_date - move_date).days) > NEWS_DATE_WINDOW_DAYS:
-            continue
-        if article["url"] in seen_urls:
-            continue
-        seen_urls.add(article["url"])
-        articles.append(article)
+        for item in news_items:
+            if not isinstance(item, dict):
+                continue
+            article = normalize_news_item(item)
+            if article is None:
+                continue
+            if (
+                article["related_tickers"]
+                and ticker.upper() not in article["related_tickers"]
+            ):
+                continue
+            published_date = datetime.fromisoformat(article["published_at"]).date()
+            if abs((published_date - move_date).days) > NEWS_DATE_WINDOW_DAYS:
+                continue
+            if article["url"] in seen_urls:
+                continue
+            seen_urls.add(article["url"])
+            articles.append(article)
+
+    if not articles and errors:
+        raise RuntimeError(
+            "Yahoo Finance news searches failed: " + "; ".join(dict.fromkeys(errors))
+        )
+
+    articles.sort(
+        key=lambda article: (
+            ticker.upper() not in article["related_tickers"],
+            abs(
+                (
+                    datetime.fromisoformat(article["published_at"]).date()
+                    - move_date
+                ).days
+            ),
+        )
+    )
     return articles
 
 
@@ -475,6 +497,62 @@ def format_quote(quote: dict) -> str:
         f"from {start_text} to {end_text}; "
         f"{len(quote['observations'])} daily closing prices (source: Yahoo Finance)"
     )
+
+
+def format_move_news(
+    quote: dict,
+    moves: list[dict],
+    news_by_move: dict[str, list[dict]],
+    news_errors: dict[str, str],
+) -> list[str]:
+    """Format significant moves and related-news context for the CLI conversation."""
+    lines = []
+    for move in moves:
+        move_date = datetime.fromisoformat(
+            move["current"]["observed_at"]
+        ).date()
+        move_date_text = move_date.isoformat()
+        lines.append(
+            f"Significant move on {move_date_text}: "
+            f"{move['percent_change']:+.2f}% "
+            f"({move['change']:+,.2f} {quote['currency']})."
+        )
+        if move_date_text in news_errors:
+            lines.append(f"  Related news lookup failed: {news_errors[move_date_text]}")
+            continue
+        articles = news_by_move.get(move_date_text, [])
+        if not articles:
+            lines.append(
+                f"  No matching news found within {NEWS_DATE_WINDOW_DAYS} days."
+            )
+            continue
+        for article in articles:
+            published_date = datetime.fromisoformat(
+                article["published_at"]
+            ).date()
+            offset = (published_date - move_date).days
+            timing = (
+                "on the move date"
+                if offset == 0
+                else f"{abs(offset)} day(s) "
+                f"{'after' if offset > 0 else 'before'} the move"
+            )
+            association = (
+                f"Yahoo tags it to {quote['ticker']}"
+                if quote["ticker"].upper() in article["related_tickers"]
+                else f"Yahoo returned it for a {quote['ticker']} news search"
+            )
+            lines.append(
+                f"  News: {article['title']} "
+                f"({article['publisher']}, {published_date.isoformat()})"
+            )
+            if article.get("summary"):
+                lines.append(f"  Summary: {article['summary']}")
+            lines.append(
+                f"  Why related: {association}; it was published {timing}. "
+                "This is potential context, not proof of causation."
+            )
+    return lines
 
 
 def write_report(
@@ -594,6 +672,29 @@ def write_report(
                     lines.append(
                         f"  - {escape_markdown_text(article['summary'])}"
                     )
+                move_day = datetime.fromisoformat(
+                    move["current"]["observed_at"]
+                ).date()
+                article_day = datetime.fromisoformat(
+                    article["published_at"]
+                ).date()
+                day_offset = (article_day - move_day).days
+                timing = (
+                    "on the move date"
+                    if day_offset == 0
+                    else f"{abs(day_offset)} day(s) "
+                    f"{'after' if day_offset > 0 else 'before'} the move"
+                )
+                association = (
+                    f"Yahoo tags this article to {quote['ticker']}"
+                    if quote["ticker"].upper() in article["related_tickers"]
+                    else f"Yahoo returned this article for a {quote['ticker']} news search"
+                )
+                lines.append(
+                    f"  - Why it may be related: {association}; it was published "
+                    f"{timing}. The timing/topic offer potential context, not proof "
+                    "that the article caused the price move."
+                )
         lines.append("")
 
     lines.extend(
@@ -686,6 +787,10 @@ def main() -> int:
                 news_errors,
             )
             print(f"{format_quote(quote)}")
+            for line in format_move_news(
+                quote, moves, news_by_move, news_errors
+            ):
+                print(line)
             print(f"Report: {report_path.relative_to(PROJECT_ROOT)}")
         except (RuntimeError, ValueError, OSError, sqlite3.Error) as error:
             print(f"Error: {error}", file=sys.stderr)
