@@ -54,24 +54,20 @@ The database is created at `.state/stock_market_watcher.db`; runtime data is exc
 
 ### Fetch and store a price snapshot
 
-Fetch daily closing prices for the last calendar month (the default) and append them to the database:
 Fetch daily closing prices for the last calendar month ending today (the default) and append them to the database:
 
 ```bash
 python3 scripts/stock_watcher.py price --brand "Microsoft"
 ```
 
-Each successful `price` command stores the available daily closes in `snapshots`, linked to the company and Yahoo Finance source, with both the capture time and the market's observation time. Previous snapshots are retained. The command prints the net price and percentage change between the first and last available closes, and writes a Markdown summary in `reports/`. An internet connection is required.
-Each successful `price` command stores the available daily closes in `snapshots`, linked to the company and Yahoo Finance source, with both the capture time and the market's observation time. Previous snapshots are retained. The command prints the net price and percentage change between the first and last available closes, and writes a Markdown summary in `reports/` with date coverage, starting and ending closes, net and percentage change calculations, highest and lowest closes, mean close, daily return volatility, and a table of every retrieved close. The report is quantitative only; related news is not included yet. An internet connection is required.
+Each successful `price` command stores the available daily closes in `snapshots`, linked to the company and Yahoo Finance source, with both the capture time and the market's observation time. Previous snapshots are retained. The command prints the net price and percentage change between the first and last available closes, and writes a Markdown summary in `reports/` with date coverage, price metrics, and every retrieved close. Daily close-to-close moves of 3% or more (up or down) are highlighted, and the script searches Yahoo Finance for related news published within three days of each move. Matching articles and their source links are included in the report and stored in `news_items`. If no matching article is found, or a news lookup fails, the report states that explicitly. An internet connection is required.
 
-Choose a different lookback in calendar months:
 Choose a different lookback in calendar months; `--fromdate` can also set the range's end date:
 
 ```bash
 python3 scripts/stock_watcher.py price --brand "Microsoft" --months 6
 ```
 
-Or provide an explicit start date in `YYYY-MM-DD` format; data is fetched from that date through today:
 For example, fetch the six months ending on the specified date:
 
 ```bash
@@ -86,14 +82,13 @@ The general workflow is as follows:
 
 1. Parse the natural-language request to identify the brand, requested date range, and whether a comparison with previous snapshots is needed. If no date range is provided, use the last month.
 2. Map the brand name to its standardized stock ticker symbol (for example, Google to GOOG).
-3. Select appropriate public market-data and news sources for the ticker, and save the sources with the watched brand so later updates can use them.
 3. Select the public market-data source for the ticker.
 4. Fetch historical daily closing prices for the requested period.
 5. Calculate trend metrics such as net price change, percentage change, and daily volatility.
 6. Store the brand, ticker, source information, and point-in-time price observations in the local SQLite database. Append new observations to the existing history rather than replacing earlier snapshots.
 7. When previous snapshots are available or the request asks for a review, compare the latest prices and calculated changes with prior observations and flag notable movements (for example, changes over 3%).
-8. Write a formatted Markdown report with the sources, price trends, metrics, relevant news, and any comparison findings, then display the report in chat.
-8. Write and display a Markdown report containing the date range, quantitative metrics and calculations, and daily closing-price table. Do not include news yet.
+8. For each close-to-close move of at least 3%, search public Yahoo Finance news around that date and associate matching articles with that day's snapshot.
+9. Write a Markdown report with the sources, price trends, significant daily moves, related news (or an explicit unavailable/no-match note), and comparison findings.
 
 ## What the package actually does
 

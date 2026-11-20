@@ -20,7 +20,7 @@ Do not use this skill for non-financial questions, requests to perform trades, s
 ## Prerequisites & Environment
 - Expected working directory for the skill: skills/stock-market-watcher
 - Required runtime: Python 3.10+; use the Python standard library modules `sqlite3`, `argparse`, `json`, and `pathlib` without installing additional packages for basic persistence and file handling.
-- Browser/data-fetch dependency: install `playwright` and a Chromium runtime for public market-page and news lookups (`python -m pip install playwright` and `python -m playwright install chromium`).
+- The current CLI uses Python's standard library to request public Yahoo Finance JSON endpoints; no browser automation or package installation is required.
 - Local SQLite state path: /skills/stock-market-watcher/.state/stock_market_watcher.db. This database is intentionally untracked in git and should be treated as local runtime state only.
 - Markdown report output path: /skills/stock-market-watcher/reports/. Create the directory if it does not exist; generated reports are untracked in git and should be written there.
 - Supporting folders: /skills/stock-market-watcher/references/ for static reference material and /skills/stock-market-watcher/agents/ for any agent-specific scripts or helper logic.
@@ -35,10 +35,11 @@ Trigger this workflow when the user asks for a company's current stock value, re
 
 1. Identify the company and ticker from the request. If the ticker or source is uncertain, verify it with a public market-data source; consult `references/` for source guidance if it is populated.
 2. Extract the requested date range. If the user specifies a number of months, run `python3 scripts/stock_watcher.py price --brand "<brand>" --months <n>`. If they specify a start date, use `--fromdate YYYY-MM-DD`. If no range is specified, omit both options; the default is the last calendar month. The options cannot be combined.
-2. Use `--months <n>` for the number of calendar months to track (default: 1). `--fromdate YYYY-MM-DD` sets the range's end date (default: today); the start date is that many months before the end date. For example, `--months 3 --fromdate 2025-11-16` fetches the three months ending November 16, 2025.
-2. Use `--months <n>` for the number of calendar months to track (default: 1). `--fromdate YYYY-MM-DD` sets the range's end date (default: today); the start date is that many months before the end date. For example, `--months 3 --fromdate 2025-11-16` fetches the three months ending November 16, 2025.
-3. The command fetches daily closing prices within that range, appends each available observation to `.state/stock_market_watcher.db`, and writes a dated Markdown report with the requested and observed dates, price metrics, calculation results, and daily closes. Do not fetch or include related news in this report yet.
-4. Present the command's printed net-change result and report contents in the Codex conversation. State the actual observation dates, price currency, and Yahoo Finance as the source; identify the values as historical closing prices.
+3. Use `--months <n>` for the number of calendar months to track (default: 1). `--fromdate YYYY-MM-DD` sets the range's end date (default: today); the start date is that many months before the end date. For example, `--months 3 --fromdate 2025-11-16` fetches the three months ending November 16, 2025.
+4. The command fetches daily closing prices within that range and appends each observation to `.state/stock_market_watcher.db`.
+5. For each daily close-to-close change of at least 3% in either direction, search Yahoo Finance for news published within three days of the move. Store matched articles in `news_items`, associated with the changed day's snapshot. If the lookup fails or finds no matching articles, report that explicitly.
+6. The command writes a dated Markdown report with the requested and observed dates, price metrics, daily closes, significant moves, matching news links, and sources.
+7. Present the command's result and report contents in the Codex conversation. State the actual observation dates, price currency, and Yahoo Finance as the source; identify the values as historical closing prices.
 
 ### Compare snapshots
 

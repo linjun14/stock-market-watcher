@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 from statistics import fmean, pstdev
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
 
@@ -20,6 +20,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 STATE_DIR_NAME = ".state"
 REPORTS_DIR_NAME = "reports"
 DATABASE_NAME = "stock_market_watcher.db"
+SIGNIFICANT_CHANGE_PERCENT = 3.0
+NEWS_DATE_WINDOW_DAYS = 3
 
 
 # Create the tables used for companies, data sources, price snapshots, and news.
@@ -235,6 +237,140 @@ def fetch_stock_history(brand: str, start_date: date, end_date: date) -> dict:
     }
 
 
+def significant_moves(quote: dict) -> list[dict]:
+    """Return daily close-to-close moves meeting the significance threshold."""
+    observations = sorted(quote["observations"], key=lambda item: item["observed_at"])
+    moves = []
+    for previous, current in zip(observations, observations[1:]):
+        if not previous["price"]:
+            continue
+        change = current["price"] - previous["price"]
+        percent_change = change / previous["price"] * 100
+        if abs(percent_change) >= SIGNIFICANT_CHANGE_PERCENT:
+            moves.append(
+                {
+                    "previous": previous,
+                    "current": current,
+                    "change": change,
+                    "percent_change": percent_change,
+                }
+            )
+    return moves
+
+
+def parse_news_date(value: object) -> datetime | None:
+    """Parse Yahoo's epoch or ISO publication timestamp into UTC."""
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value, timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    return None
+
+
+def normalize_news_item(item: dict) -> dict | None:
+    """Normalize legacy and current Yahoo Finance news response shapes."""
+    content = item.get("content")
+    if not isinstance(content, dict):
+        content = item
+    title = content.get("title")
+    if not isinstance(title, str) or not title.strip():
+        return None
+
+    url = content.get("link")
+    if not isinstance(url, str):
+        for key in ("canonicalUrl", "clickThroughUrl"):
+            candidate = content.get(key)
+            if isinstance(candidate, dict) and isinstance(candidate.get("url"), str):
+                url = candidate["url"]
+                break
+    parsed_url = urlparse(url) if isinstance(url, str) else None
+    if (
+        parsed_url is None
+        or parsed_url.scheme not in {"http", "https"}
+        or not parsed_url.netloc
+    ):
+        return None
+
+    published_at = parse_news_date(
+        content.get("providerPublishTime") or content.get("pubDate")
+    )
+    if published_at is None:
+        return None
+
+    provider = content.get("provider")
+    publisher = (
+        provider.get("displayName")
+        if isinstance(provider, dict)
+        else content.get("publisher")
+    )
+    related_tickers = content.get("relatedTickers") or item.get("relatedTickers") or []
+    if not isinstance(related_tickers, list):
+        related_tickers = []
+    symbols = set()
+    for related in related_tickers:
+        symbol = related.get("symbol") if isinstance(related, dict) else related
+        if isinstance(symbol, str):
+            symbols.add(symbol.upper())
+    summary = (
+        content.get("summary")
+        or content.get("description")
+        or content.get("synopsis")
+    )
+    return {
+        "title": title.strip(),
+        "url": url,
+        "published_at": published_at.isoformat(),
+        "publisher": publisher if isinstance(publisher, str) else "Yahoo Finance",
+        "summary": summary if isinstance(summary, str) else None,
+        "related_tickers": symbols,
+    }
+
+
+def fetch_related_news(ticker: str, move_date: date) -> list[dict]:
+    """Fetch public news published near a significant move date."""
+    search_url = "https://query1.finance.yahoo.com/v1/finance/search?" + urlencode(
+        {
+            "q": f"{ticker} {move_date.isoformat()}",
+            "quotesCount": 0,
+            "newsCount": 10,
+        }
+    )
+    response = fetch_json(search_url)
+    news_items = response.get("news") or []
+    if not isinstance(news_items, list):
+        raise RuntimeError("Yahoo Finance returned an invalid news response.")
+    articles = []
+    seen_urls = set()
+    for item in news_items:
+        if not isinstance(item, dict):
+            continue
+        article = normalize_news_item(item)
+        if article is None:
+            continue
+        if (
+            article["related_tickers"]
+            and ticker.upper() not in article["related_tickers"]
+        ):
+            continue
+        published_date = datetime.fromisoformat(article["published_at"]).date()
+        if abs((published_date - move_date).days) > NEWS_DATE_WINDOW_DAYS:
+            continue
+        if article["url"] in seen_urls:
+            continue
+        seen_urls.add(article["url"])
+        articles.append(article)
+    return articles
+
+
 def store_snapshot(quote: dict, database_path: Path) -> int:
     """Append a quote to the database and return its snapshot ID."""
     captured_at = datetime.now(timezone.utc).isoformat()
@@ -282,6 +418,46 @@ def store_snapshot(quote: dict, database_path: Path) -> int:
         return cursor.lastrowid
 
 
+def store_news_item(
+    article: dict, snapshot_id: int, database_path: Path
+) -> None:
+    """Append a related article and its source to the local database."""
+    source_url = "https://query1.finance.yahoo.com/v1/finance/search"
+    with closing(sqlite3.connect(database_path)) as connection, connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute(
+            "INSERT INTO sources (name, url) VALUES (?, ?) "
+            "ON CONFLICT(url) DO UPDATE SET name = excluded.name",
+            ("Yahoo Finance News Search", source_url),
+        )
+        source_id = connection.execute(
+            "SELECT source_id FROM sources WHERE url = ?",
+            (source_url,),
+        ).fetchone()[0]
+        connection.execute(
+            """
+            INSERT INTO news_items (
+                snapshot_id, source_id, published_at, title, url, summary
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot_id,
+                source_id,
+                article["published_at"],
+                article["title"],
+                article["url"],
+                article["summary"],
+            ),
+        )
+
+
+def escape_markdown_text(value: str) -> str:
+    """Escape untrusted text before including it in a Markdown report."""
+    for character in ("\\", "`", "*", "_", "{", "}", "[", "]", "<", ">", "|"):
+        value = value.replace(character, f"\\{character}")
+    return value.replace("\n", " ").replace("\r", " ")
+
+
 def format_quote(quote: dict) -> str:
     """Format the requested period's price change for display."""
     precision = quote["price_hint"]
@@ -306,8 +482,11 @@ def write_report(
     report_dir: Path,
     requested_start: date,
     requested_end: date,
+    moves: list[dict] | None = None,
+    news_by_move: dict[str, list[dict]] | None = None,
+    news_errors: dict[str, str] | None = None,
 ) -> Path:
-    """Write a quantitative Markdown summary for the requested date range."""
+    """Write a Markdown summary of price performance and related news."""
     precision = quote["price_hint"]
     if not isinstance(precision, int) or not 0 <= precision <= 8:
         precision = 2
@@ -361,11 +540,71 @@ def write_report(
             else "- Daily return volatility: N/A (fewer than two daily returns)"
         ),
         "",
-        "## Daily Closing Prices",
+        f"## Significant Daily Moves (absolute return >= {SIGNIFICANT_CHANGE_PERCENT:.0f}%)",
         "",
-        f"| Date | Close ({quote['currency']}) | Change ({quote['currency']}) | Daily return |",
-        "| --- | ---: | ---: | ---: |",
     ]
+    moves = moves if moves is not None else significant_moves(quote)
+    news_by_move = news_by_move or {}
+    news_errors = news_errors or {}
+    if not moves:
+        lines.append("No daily close-to-close moves met the significance threshold.")
+    for move in moves:
+        move_date = observed_date(move["current"])
+        lines.extend(
+            [
+                f"### {move_date}: {move['percent_change']:+.2f}%",
+                "",
+                f"- Close-to-close change: {move['change']:+,.{precision}f} "
+                f"{quote['currency']} "
+                f"({price_text(move['previous']['price'])} to "
+                f"{price_text(move['current']['price'])})",
+            ]
+        )
+        if move_date in news_errors:
+            lines.extend(
+                [
+                    f"- Related news lookup failed: "
+                    f"{escape_markdown_text(news_errors[move_date])}",
+                ]
+            )
+        else:
+            articles = news_by_move.get(move_date, [])
+            if not articles:
+                lines.append(
+                    "- No matching news found within "
+                    f"{NEWS_DATE_WINDOW_DAYS} days of this move."
+                )
+            for article in articles:
+                published_date = datetime.fromisoformat(
+                    article["published_at"]
+                ).strftime("%Y-%m-%d")
+                safe_title = escape_markdown_text(article["title"])
+                safe_publisher = escape_markdown_text(article["publisher"])
+                safe_url = (
+                    article["url"]
+                    .replace(" ", "%20")
+                    .replace("(", "%28")
+                    .replace(")", "%29")
+                )
+                lines.append(
+                    f"- [{safe_title}]({safe_url}) - {safe_publisher}, "
+                    f"{published_date}"
+                )
+                if article.get("summary"):
+                    lines.append(
+                        f"  - {escape_markdown_text(article['summary'])}"
+                    )
+        lines.append("")
+
+    lines.extend(
+        [
+            "",
+            "## Daily Closing Prices",
+            "",
+            f"| Date | Close ({quote['currency']}) | Change ({quote['currency']}) | Daily return |",
+            "| --- | ---: | ---: | ---: |",
+        ]
+    )
     previous = None
     for observation in observations:
         if previous is None:
@@ -410,13 +649,41 @@ def main() -> int:
             database_path = initialize_project()
             start_date, end_date = get_date_range(args.months, args.fromdate)
             quote = fetch_stock_history(args.brand, start_date, end_date)
+            snapshot_ids = {}
             for observation in quote["observations"]:
-                store_snapshot({**quote, **observation}, database_path)
+                snapshot_ids[observation["observed_at"]] = store_snapshot(
+                    {**quote, **observation}, database_path
+                )
+            moves = significant_moves(quote)
+            news_by_move = {}
+            news_errors = {}
+            for move in moves:
+                move_date = datetime.fromisoformat(
+                    move["current"]["observed_at"]
+                ).date()
+                move_date_text = move_date.isoformat()
+                try:
+                    articles = fetch_related_news(quote["ticker"], move_date)
+                except RuntimeError as error:
+                    news_errors[move_date_text] = str(error)
+                    print(
+                        f"Warning: related news lookup failed for "
+                        f"{move_date_text}: {error}",
+                        file=sys.stderr,
+                    )
+                    continue
+                news_by_move[move_date_text] = articles
+                snapshot_id = snapshot_ids[move["current"]["observed_at"]]
+                for article in articles:
+                    store_news_item(article, snapshot_id, database_path)
             report_path = write_report(
                 quote,
                 PROJECT_ROOT / REPORTS_DIR_NAME,
                 start_date,
                 end_date,
+                moves,
+                news_by_move,
+                news_errors,
             )
             print(f"{format_quote(quote)}")
             print(f"Report: {report_path.relative_to(PROJECT_ROOT)}")
