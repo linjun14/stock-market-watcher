@@ -5,7 +5,10 @@ import argparse
 import calendar
 from contextlib import closing
 from datetime import date, datetime, time, timedelta, timezone
+from email.utils import parsedate_to_datetime
+import html
 import json
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -13,6 +16,7 @@ from statistics import fmean, pstdev
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
+from xml.etree import ElementTree
 
 
 # Keep runtime files beside the repository, regardless of the caller's cwd.
@@ -21,7 +25,7 @@ STATE_DIR_NAME = ".state"
 REPORTS_DIR_NAME = "reports"
 DATABASE_NAME = "stock_market_watcher.db"
 SIGNIFICANT_CHANGE_PERCENT = 3.0
-NEWS_DATE_WINDOW_DAYS = 3
+NEWS_DATE_WINDOW_DAYS = 30
 
 
 # Create the tables used for companies, data sources, price snapshots, and news.
@@ -180,6 +184,85 @@ def fetch_json(url: str) -> dict:
         raise RuntimeError("The market data service returned invalid JSON.") from error
 
 
+def parse_google_news_rss(payload: bytes) -> list[dict]:
+    """Parse Google News RSS entries into the shared article shape."""
+    try:
+        root = ElementTree.fromstring(payload)
+    except ElementTree.ParseError as error:
+        raise RuntimeError("Google News returned an invalid RSS feed.") from error
+
+    articles = []
+    for item in root.findall(".//item"):
+        title = item.findtext("title")
+        url = item.findtext("link")
+        published_text = item.findtext("pubDate")
+        if not title or not url or not published_text:
+            continue
+        try:
+            published_at = parsedate_to_datetime(published_text)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if published_at.tzinfo is None:
+            published_at = published_at.replace(tzinfo=timezone.utc)
+        parsed_url = urlparse(url)
+        if (
+            parsed_url.scheme not in {"http", "https"}
+            or not parsed_url.netloc
+        ):
+            continue
+
+        source_element = item.find("source")
+        publisher = (
+            source_element.text.strip()
+            if source_element is not None and source_element.text
+            else "Google News"
+        )
+        description = item.findtext("description")
+        summary = (
+            re.sub(
+                r"\s+([.,;:!?])",
+                r"\1",
+                " ".join(
+                    html.unescape(re.sub(r"<[^>]*>", " ", description)).split()
+                ),
+            )
+            if description
+            else None
+        )
+        articles.append(
+            {
+                "title": html.unescape(title).strip(),
+                "url": url,
+                "published_at": published_at.astimezone(timezone.utc).isoformat(),
+                "publisher": publisher,
+                "summary": summary or None,
+                "related_tickers": set(),
+                "search_provider": "Google News",
+            }
+        )
+    return articles
+
+
+def fetch_google_news(query: str) -> list[dict]:
+    """Search Google News using its public RSS feed."""
+    url = "https://news.google.com/rss/search?" + urlencode(
+        {"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"}
+    )
+    request = Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; StockMarketWatcher/1.0)"},
+    )
+    try:
+        with urlopen(request, timeout=15) as response:
+            return parse_google_news_rss(response.read())
+    except HTTPError as error:
+        raise RuntimeError(f"Google News request failed (HTTP {error.code}).") from error
+    except URLError as error:
+        raise RuntimeError(
+            f"Could not reach Google News: {error.reason}"
+        ) from error
+
+
 def fetch_stock_history(brand: str, start_date: date, end_date: date) -> dict:
     """Resolve a brand and return daily closes within the requested date range."""
     search_url = "https://query1.finance.yahoo.com/v1/finance/search?" + urlencode(
@@ -332,24 +415,27 @@ def normalize_news_item(item: dict) -> dict | None:
         "publisher": publisher if isinstance(publisher, str) else "Yahoo Finance",
         "summary": summary if isinstance(summary, str) else None,
         "related_tickers": symbols,
+        "search_provider": "Yahoo Finance",
     }
 
 
-def fetch_related_news(ticker: str, move_date: date) -> list[dict]:
-    """Fetch and merge ticker and date-specific news near a significant move."""
+def fetch_related_news(
+    ticker: str, move_date: date, company: str | None = None
+) -> list[dict]:
+    """Search multiple news sources near a move, with a closest-result fallback."""
     search_url = "https://query1.finance.yahoo.com/v1/finance/search?"
-    articles = []
+    candidates = []
     seen_urls = set()
     errors = []
-    queries = (f"{ticker} {move_date.isoformat()}", ticker)
-    for query in queries:
+    yahoo_queries = (f"{ticker} {move_date.isoformat()}", ticker)
+    for query in yahoo_queries:
         url = search_url + urlencode(
             {"q": query, "quotesCount": 0, "newsCount": 25}
         )
         try:
             response = fetch_json(url)
         except RuntimeError as error:
-            errors.append(str(error))
+            errors.append(f"Yahoo Finance: {error}")
             continue
         news_items = response.get("news") or []
         if not isinstance(news_items, list):
@@ -366,20 +452,34 @@ def fetch_related_news(ticker: str, move_date: date) -> list[dict]:
                 and ticker.upper() not in article["related_tickers"]
             ):
                 continue
-            published_date = datetime.fromisoformat(article["published_at"]).date()
-            if abs((published_date - move_date).days) > NEWS_DATE_WINDOW_DAYS:
-                continue
             if article["url"] in seen_urls:
                 continue
             seen_urls.add(article["url"])
-            articles.append(article)
+            candidates.append(article)
 
-    if not articles and errors:
+    subject = f'"{company}" {ticker}' if company else ticker
+    google_queries = (
+        f"{subject} {move_date.isoformat()}",
+        f"{subject} stock",
+    )
+    for query in google_queries:
+        try:
+            articles = fetch_google_news(query)
+        except RuntimeError as error:
+            errors.append(f"Google News: {error}")
+            continue
+        for article in articles:
+            if article["url"] in seen_urls:
+                continue
+            seen_urls.add(article["url"])
+            candidates.append(article)
+
+    if not candidates and errors:
         raise RuntimeError(
-            "Yahoo Finance news searches failed: " + "; ".join(dict.fromkeys(errors))
+            "News searches failed: " + "; ".join(dict.fromkeys(errors))
         )
 
-    articles.sort(
+    candidates.sort(
         key=lambda article: (
             ticker.upper() not in article["related_tickers"],
             abs(
@@ -390,7 +490,29 @@ def fetch_related_news(ticker: str, move_date: date) -> list[dict]:
             ),
         )
     )
-    return articles
+
+    def days_from_move(article: dict) -> int:
+        return abs(
+            (
+                datetime.fromisoformat(article["published_at"]).date()
+                - move_date
+            ).days
+        )
+
+    in_window = [
+        article
+        for article in candidates
+        if days_from_move(article) <= NEWS_DATE_WINDOW_DAYS
+    ]
+    if in_window:
+        return in_window
+    return sorted(
+        candidates,
+        key=lambda article: (
+            days_from_move(article),
+            ticker.upper() not in article["related_tickers"],
+        ),
+    )[:1]
 
 
 def store_snapshot(quote: dict, database_path: Path) -> int:
@@ -444,13 +566,19 @@ def store_news_item(
     article: dict, snapshot_id: int, database_path: Path
 ) -> None:
     """Append a related article and its source to the local database."""
-    source_url = "https://query1.finance.yahoo.com/v1/finance/search"
+    search_provider = article.get("search_provider", "Yahoo Finance")
+    if search_provider == "Google News":
+        source_name = "Google News RSS Search"
+        source_url = "https://news.google.com/rss/search"
+    else:
+        source_name = "Yahoo Finance News Search"
+        source_url = "https://query1.finance.yahoo.com/v1/finance/search"
     with closing(sqlite3.connect(database_path)) as connection, connection:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(
             "INSERT INTO sources (name, url) VALUES (?, ?) "
             "ON CONFLICT(url) DO UPDATE SET name = excluded.name",
-            ("Yahoo Finance News Search", source_url),
+            (source_name, source_url),
         )
         source_id = connection.execute(
             "SELECT source_id FROM sources WHERE url = ?",
@@ -523,7 +651,7 @@ def format_move_news(
         articles = news_by_move.get(move_date_text, [])
         if not articles:
             lines.append(
-                f"  No matching news found within {NEWS_DATE_WINDOW_DAYS} days."
+                "  No related news article was returned by Yahoo Finance or Google News."
             )
             continue
         for article in articles:
@@ -540,8 +668,13 @@ def format_move_news(
             association = (
                 f"Yahoo tags it to {quote['ticker']}"
                 if quote["ticker"].upper() in article["related_tickers"]
-                else f"Yahoo returned it for a {quote['ticker']} news search"
+                else (
+                    f"{article.get('search_provider', 'Yahoo Finance')} "
+                    f"returned it for a {quote['ticker']} news search"
+                )
             )
+            if abs(offset) > NEWS_DATE_WINDOW_DAYS:
+                association = f"closest available result; {association}"
             lines.append(
                 f"  News: {article['title']} "
                 f"({article['publisher']}, {published_date.isoformat()})"
@@ -649,8 +782,8 @@ def write_report(
             articles = news_by_move.get(move_date, [])
             if not articles:
                 lines.append(
-                    "- No matching news found within "
-                    f"{NEWS_DATE_WINDOW_DAYS} days of this move."
+                    "- Yahoo Finance and Google News returned no related news "
+                    "article for this move."
                 )
             for article in articles:
                 published_date = datetime.fromisoformat(
@@ -688,8 +821,13 @@ def write_report(
                 association = (
                     f"Yahoo tags this article to {quote['ticker']}"
                     if quote["ticker"].upper() in article["related_tickers"]
-                    else f"Yahoo returned this article for a {quote['ticker']} news search"
+                    else (
+                        f"{article.get('search_provider', 'Yahoo Finance')} "
+                        f"returned this article for a {quote['ticker']} news search"
+                    )
                 )
+                if abs(day_offset) > NEWS_DATE_WINDOW_DAYS:
+                    association = f"closest available result; {association}"
                 lines.append(
                     f"  - Why it may be related: {association}; it was published "
                     f"{timing}. The timing/topic offer potential context, not proof "
@@ -764,7 +902,9 @@ def main() -> int:
                 ).date()
                 move_date_text = move_date.isoformat()
                 try:
-                    articles = fetch_related_news(quote["ticker"], move_date)
+                    articles = fetch_related_news(
+                        quote["ticker"], move_date, quote["company"]
+                    )
                 except RuntimeError as error:
                     news_errors[move_date_text] = str(error)
                     print(
