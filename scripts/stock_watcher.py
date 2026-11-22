@@ -25,7 +25,7 @@ STATE_DIR_NAME = ".state"
 REPORTS_DIR_NAME = "reports"
 DATABASE_NAME = "stock_market_watcher.db"
 SIGNIFICANT_CHANGE_PERCENT = 3.0
-NEWS_DATE_WINDOW_DAYS = 30
+NEWS_DATE_WINDOW_DAYS = 3
 
 
 # Create the tables used for companies, data sources, price snapshots, and news.
@@ -473,6 +473,46 @@ def fetch_related_news(
                 continue
             seen_urls.add(article["url"])
             candidates.append(article)
+
+    if not candidates and company:
+        try:
+            response = fetch_json(
+                search_url
+                + urlencode({"q": company, "quotesCount": 0, "newsCount": 25})
+            )
+        except RuntimeError as error:
+            errors.append(f"Yahoo Finance company-name search: {error}")
+        else:
+            news_items = response.get("news") or []
+            if not isinstance(news_items, list):
+                errors.append("Yahoo Finance returned an invalid company-name news response.")
+            else:
+                for item in news_items:
+                    if not isinstance(item, dict):
+                        continue
+                    article = normalize_news_item(item)
+                    if (
+                        article is None
+                        or (
+                            article["related_tickers"]
+                            and ticker.upper() not in article["related_tickers"]
+                        )
+                        or article["url"] in seen_urls
+                    ):
+                        continue
+                    seen_urls.add(article["url"])
+                    candidates.append(article)
+
+        try:
+            articles = fetch_google_news(company)
+        except RuntimeError as error:
+            errors.append(f"Google News company-name search: {error}")
+        else:
+            for article in articles:
+                if article["url"] in seen_urls:
+                    continue
+                seen_urls.add(article["url"])
+                candidates.append(article)
 
     if not candidates and errors:
         raise RuntimeError(

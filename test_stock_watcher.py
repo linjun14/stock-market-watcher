@@ -35,7 +35,7 @@ class RelatedNewsTests(unittest.TestCase):
         self.untagged_article = news_item(
             "Analyst discusses company outlook",
             "https://example.com/outlook",
-            datetime(2026, 11, 8),
+            datetime(2026, 11, 17),
         )
 
     def test_fetches_date_and_ticker_searches_and_merges_deduplicated_results(self):
@@ -112,6 +112,59 @@ class RelatedNewsTests(unittest.TestCase):
             report,
         )
         self.assertIn("closest available result", report)
+
+    def test_company_name_fallback_returns_closest_related_article(self):
+        older_article = news_item(
+            "Nvidia expands AI chip supply",
+            "https://example.com/nvidia-supply",
+            datetime(2026, 9, 1),
+        )
+        with (
+            patch.object(
+                stock_watcher,
+                "fetch_json",
+                side_effect=[
+                    {"news": []},
+                    {"news": []},
+                    {"news": [older_article]},
+                ],
+            ),
+            patch.object(
+                stock_watcher,
+                "fetch_google_news",
+                side_effect=[[], [], []],
+            ) as google_search,
+        ):
+            articles = stock_watcher.fetch_related_news(
+                "NVDA", self.move_date, "Nvidia"
+            )
+
+        self.assertEqual(len(articles), 1)
+        self.assertEqual(articles[0]["title"], "Nvidia expands AI chip supply")
+        self.assertEqual(google_search.call_args_list[-1].args[0], "Nvidia")
+
+    def test_prefers_articles_within_three_days_to_closest_fallback(self):
+        recent_article = news_item(
+            "Company reports recent results",
+            "https://example.com/recent-results",
+            datetime(2026, 11, 17),
+            ["ACME"],
+        )
+        older_article = news_item(
+            "Company reports results",
+            "https://example.com/results",
+            datetime(2026, 11, 10),
+            ["ACME"],
+        )
+        with patch.object(
+            stock_watcher,
+            "fetch_json",
+            side_effect=[{"news": [older_article, recent_article]}, {"news": []}],
+        ), patch.object(stock_watcher, "fetch_google_news", return_value=[]):
+            articles = stock_watcher.fetch_related_news("ACME", self.move_date)
+
+        self.assertEqual(len(articles), 1)
+        self.assertEqual(articles[0]["url"], "https://example.com/recent-results")
 
     def test_google_news_rss_article_is_included_and_attributed(self):
         article = {
