@@ -38,6 +38,25 @@ class RelatedNewsTests(unittest.TestCase):
             datetime(2026, 11, 17),
         )
 
+    def test_significant_moves_returns_top_three_without_percentage_threshold(self):
+        quote = {
+            "observations": [
+                {"price": 100.0, "observed_at": "2026-11-17T00:00:00+00:00"},
+                {"price": 101.0, "observed_at": "2026-11-18T00:00:00+00:00"},
+                {"price": 103.0, "observed_at": "2026-11-19T00:00:00+00:00"},
+                {"price": 99.0, "observed_at": "2026-11-20T00:00:00+00:00"},
+                {"price": 100.5, "observed_at": "2026-11-21T00:00:00+00:00"},
+            ]
+        }
+
+        moves = stock_watcher.significant_moves(quote)
+
+        self.assertEqual(len(moves), 3)
+        self.assertEqual(
+            [move["percent_change"] for move in moves],
+            [-3.8834951456310676, 1.9801980198019802, 1.5151515151515151],
+        )
+
     def test_fetches_date_and_ticker_searches_and_merges_deduplicated_results(self):
         responses = [
             {"news": [self.tagged_article]},
@@ -106,6 +125,11 @@ class RelatedNewsTests(unittest.TestCase):
                 news_by_move,
             )
             report = report_path.read_text(encoding="utf-8")
+
+        prefix, separator, filename_date = report_path.name[:-3].partition("_")
+        self.assertEqual(prefix, "ACME")
+        self.assertEqual(separator, "_")
+        datetime.strptime(filename_date, "%Y%m%d")
 
         self.assertIn(
             "[Acme announces a product update](https://example.com/product-update)",

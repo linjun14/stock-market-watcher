@@ -24,7 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 STATE_DIR_NAME = ".state"
 REPORTS_DIR_NAME = "reports"
 DATABASE_NAME = "stock_market_watcher.db"
-SIGNIFICANT_CHANGE_PERCENT = 3.0
+TOP_PRICE_CHANGE_COUNT = 3
 NEWS_DATE_WINDOW_DAYS = 3
 
 
@@ -321,7 +321,7 @@ def fetch_stock_history(brand: str, start_date: date, end_date: date) -> dict:
 
 
 def significant_moves(quote: dict) -> list[dict]:
-    """Return daily close-to-close moves meeting the significance threshold."""
+    """Return the largest daily close-to-close moves, up to a fixed limit."""
     observations = sorted(quote["observations"], key=lambda item: item["observed_at"])
     moves = []
     for previous, current in zip(observations, observations[1:]):
@@ -329,16 +329,16 @@ def significant_moves(quote: dict) -> list[dict]:
             continue
         change = current["price"] - previous["price"]
         percent_change = change / previous["price"] * 100
-        if abs(percent_change) >= SIGNIFICANT_CHANGE_PERCENT:
-            moves.append(
-                {
-                    "previous": previous,
-                    "current": current,
-                    "change": change,
-                    "percent_change": percent_change,
-                }
-            )
-    return moves
+        moves.append(
+            {
+                "previous": previous,
+                "current": current,
+                "change": change,
+                "percent_change": percent_change,
+            }
+        )
+    moves.sort(key=lambda move: abs(move["percent_change"]), reverse=True)
+    return moves[:TOP_PRICE_CHANGE_COUNT]
 
 
 def parse_news_date(value: object) -> datetime | None:
@@ -791,14 +791,14 @@ def write_report(
             else "- Daily return volatility: N/A (fewer than two daily returns)"
         ),
         "",
-        f"## Significant Daily Moves (absolute return >= {SIGNIFICANT_CHANGE_PERCENT:.0f}%)",
+        f"## Top {TOP_PRICE_CHANGE_COUNT} Daily Price Changes",
         "",
     ]
     moves = moves if moves is not None else significant_moves(quote)
     news_by_move = news_by_move or {}
     news_errors = news_errors or {}
     if not moves:
-        lines.append("No daily close-to-close moves met the significance threshold.")
+        lines.append("No daily close-to-close price changes are available.")
     for move in moves:
         move_date = observed_date(move["current"])
         lines.extend(
@@ -905,7 +905,7 @@ def write_report(
     report_dir.mkdir(parents=True, exist_ok=True)
     generated_at = datetime.now(timezone.utc)
     report_path = report_dir / (
-        f"{quote['ticker']}_{generated_at.strftime('%Y%m%dT%H%M%SZ')}.md"
+        f"{quote['ticker']}_{generated_at.strftime('%Y%m%d')}.md"
     )
     report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return report_path

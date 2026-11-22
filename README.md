@@ -86,9 +86,9 @@ The general workflow is as follows:
 4. Fetch historical daily closing prices for the requested period.
 5. Calculate trend metrics such as net price change, percentage change, and daily volatility.
 6. Store the brand, ticker, source information, and point-in-time price observations in the local SQLite database. Append new observations to the existing history rather than replacing earlier snapshots.
-7. When previous snapshots are available or the request asks for a review, compare the latest prices and calculated changes with prior observations and flag notable movements (for example, changes over 3%).
-8. For each close-to-close move of at least 3%, search public Yahoo Finance news around that date and associate matching articles with that day's snapshot.
-9. Write a Markdown report with the sources, price trends, significant daily moves, related news (or an explicit unavailable/no-match note), and comparison findings.
+7. When previous snapshots are available or the request asks for a review, compare the latest prices and calculated changes with prior observations and rank the largest daily movements.
+8. For the top 2-3 close-to-close moves by absolute percentage change, search public Yahoo Finance news around each date and associate matching articles with that day's snapshot.
+9. Write a Markdown report with the sources, price trends, top daily moves, related news (or an explicit unavailable/no-match note), and comparison findings.
 
 ## What the package actually does
 
