@@ -5,7 +5,7 @@ description: Use only when the user explicitly asks about a named company's publ
 
 # Stock Market Watcher
 
-This skill tracks a publicly traded company by name or ticker, records a timestamped price snapshot in local SQLite, and compares it with earlier observations to explain how the stock moved over time. It fetches the latest market value, keeps source metadata, and can turn the result into a brief Markdown trend summary for the user.
+This skill tracks a publicly traded company by name or ticker, records daily regular-session closing prices in local SQLite, and compares them with earlier observations to explain how the stock moved over time. Each snapshot stores the exchange's session date separately from the time the data was captured. A check on a weekend or market holiday uses the latest completed session available, such as Friday's close on Saturday or Sunday. It uses Yahoo Finance for the price series, keeps source metadata, and can turn the result into a brief Markdown trend summary for the user. It does not retrieve real-time quotes or after-hours prices.
 
 ## Overview
 
@@ -21,6 +21,7 @@ Do not use this skill for non-financial questions, requests to perform trades, s
 - Expected working directory for the skill: skills/stock-market-watcher
 - Required runtime: Python 3.10+; use the Python standard library modules `sqlite3`, `argparse`, `json`, and `pathlib` without installing additional packages for basic persistence and file handling.
 - The current CLI uses Python's standard library to request public Yahoo Finance JSON endpoints; no browser automation or package installation is required.
+- Yahoo Finance's daily chart `close` values are the sole price series; see `references/yahoo-finance-prices.md` for the endpoints, extracted fields, exchange coverage, and limitations.
 - Yahoo Finance is the sole source used for news discovery; see `references/yahoo-finance-news.md`.
 - Local SQLite state path: /skills/stock-market-watcher/.state/stock_market_watcher.db. This database is intentionally untracked in git and should be treated as local runtime state only.
 - Markdown report output path: /skills/stock-market-watcher/reports/. Create the directory if it does not exist; generated reports are untracked in git and should be written there.
@@ -32,12 +33,12 @@ Run the CLI from the skill's root directory. Historical prices are fetched from 
 
 ### Fetch and save a stock snapshot
 
-Trigger this workflow when the user asks for a company's current stock value, recent market context, or ongoing tracking that needs a new point-in-time observation.
+Trigger this workflow when the user asks for a company's stock value, recent market context, or ongoing tracking that needs a new historical daily-close observation. If the user asks for a live quote, clarify that this workflow returns historical daily closes, not a real-time price.
 
 1. Identify the company and ticker from the request. If the ticker or source is uncertain, verify it with a public market-data source; consult `references/` for source guidance if it is populated.
 2. Extract the requested date range. If the user specifies a number of months, run `python3 scripts/stock_watcher.py price --brand "<brand>" --months <n>`. If they specify a start date, use `--fromdate YYYY-MM-DD`. If no range is specified, omit both options; the default is the last calendar month. The options cannot be combined.
 3. Use `--months <n>` for the number of calendar months to track (default: 1). `--fromdate YYYY-MM-DD` sets the range's end date (default: today); the start date is that many months before the end date. For example, `--months 3 --fromdate 2025-11-16` fetches the three months ending November 16, 2025.
-4. The command fetches daily closing prices within that range and appends each observation to `.state/stock_market_watcher.db`.
+4. The command fetches completed regular-session daily closes within that range and appends each observation to `.state/stock_market_watcher.db`. It excludes the current session's daily bar until the regular session is complete. A weekend or holiday check therefore ends at the latest earlier exchange session returned by Yahoo Finance.
 5. Rank all daily close-to-close changes by absolute percentage change and select the top 2-3 moves. Search Yahoo Finance only, using the ticker and move date, and retry by ticker and company name when needed. Prefer news published within three days of each selected move; otherwise return the closest available Yahoo Finance result. Store returned articles in `news_items`, associated with the changed day's snapshot. If Yahoo Finance returns no articles or the lookup fails, report that honestly; never invent a result. See `references/yahoo-finance-news.md` for source details.
 6. The command prints each selected top move and its matching news headline, available source-provided summary, publication date, and why the article may be relevant. It also writes an initial dated Markdown report with the requested and observed dates, price metrics, daily closes, top moves, linked news, available article summaries, timing relative to each move, and sources.
 7. Before presenting the result, enrich that generated report for every news item included in the Codex response. Open the linked public article when accessible and write a fact-grounded, roughly 2-3 paragraph summary under that article in the report. Explain the reported development and relevant context from the article, then describe cautiously how its topic and publication timing may relate to the price move. Do not infer facts from a headline alone, invent details, or claim causation. Preserve the article link and any source-provided summary. If the article cannot be accessed or does not contain enough information for a detailed account, state that limitation and summarize only what is verifiable rather than padding the report.
@@ -60,10 +61,10 @@ Define these tables in `.state/stock_market_watcher.db`:
 
 - `companies(company_id, name, ticker, created_at)`
 - `sources(source_id, name, url)`
-- `snapshots(snapshot_id, company_id, source_id, captured_at, observed_at, price, currency)`
+- `snapshots(snapshot_id, company_id, source_id, captured_at, observed_at, exchange_session_date, price, currency)`
 - `news_items(news_id, snapshot_id, source_id, published_at, title, url, summary)`
 
-Each `snapshots` row represents one price observation, including its source and both collection and market observation timestamps.
+Each `snapshots` row represents one price observation. `exchange_session_date` is the exchange-local calendar date on which the regular session closed; `captured_at` is the UTC timestamp when the script retrieved and stored the snapshot. `observed_at` retains the provider's source timestamp for compatibility and traceability. On weekends, the latest session date will normally be the previous Friday, while `captured_at` records the actual weekend retrieval time. Existing databases are migrated by deriving the new session-date field from their stored provider timestamp.
 
 ## Output
 
@@ -76,5 +77,5 @@ Each `snapshots` row represents one price observation, including its source and 
 - Treat external sources as read-only and use public information only. Do not submit forms, alter remote data, create accounts, place trades, or bypass paywalls, login requirements, rate limits, anti-bot controls, or other access restrictions.
 - Never ask for, collect, store, or transmit credentials, API keys, payment details, or brokerage access. If access requires them, stop and explain that the source cannot be used.
 - Limit local writes to appending observations to `.state/stock_market_watcher.db` and creating reports under `reports/`. Never stage, commit, or otherwise track these outputs in git, and do not overwrite or delete prior observations.
-- Include the source and observation time for reported prices; distinguish delayed or historical data from live data. Do not infer missing values or present estimates as confirmed facts.
+- Include the source, exchange session date, and capture time for reported prices; distinguish delayed or historical data from live data. Do not infer missing values or present estimates as confirmed facts.
 - Clearly report unavailable, ambiguous, or incomplete data; never fabricate results or present failed fetches as successful. Keep conclusions factual, not personalized financial advice or buy/sell recommendations.

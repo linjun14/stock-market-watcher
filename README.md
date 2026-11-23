@@ -10,25 +10,23 @@ That makes it useful for ongoing market tracking rather than a one-off answer.
 
 ## Who it is for
 
-Students can learn how a Codex-compatible skill works by following this skill’s workflow and seeing how persistent state, browser lookups, and Markdown report generation each contribute to the final result.
+Students can learn how a Codex-compatible skill works by following its workflow and seeing how persistent state, public JSON endpoints, and Markdown report generation contribute to the final result.
 
 It is also for individuals interested in stock prices, researchers, and investors who want lightweight, automated market tracking, historical price comparisons, and summarized brand-related events from the command line or an agent chat.
 
 It is especially useful for people who want to:
 
 - Keep up with stock prices and relevant news without gathering information from multiple sources themselves
-- Monitor live prices and be alerted when a watched stock moves beyond a chosen threshold (eg: a 3% change in stock value)
-- Review a clear report of a brand’s stock value at a specific point in time
+- Review historical closing prices and a clear report of a brand’s stock performance over a date range
 
 ## Key Features
 
 - Extracts brand or company names and optional date ranges from natural-language prompts. If no date range is specified, it defaults to the last month.
-- Resolves brand names to public financial data sources and uses a browser to fetch live market pages.
-- Reports stock prices at a specific point in time, and fetches historical prices, trends, and related events.
-- Reports historical closing prices and quantitative trends for a requested date range.
+- Resolves brand names to ticker symbols with Yahoo Finance and fetches historical prices from its public JSON endpoints.
+- Reports historical closing prices, trends, and related events for a requested date range.
 - Computes net price change, percentage change, mean, extrema, and daily return volatility.
 - Stores point-in-time stock price observations in a local SQLite database.
-- Compares newly fetched prices with previous snapshots for the brand and flags brands with significant changes.
+- Compares newly fetched prices with previous snapshots and highlights significant daily moves.
 - Compiles findings into structured Markdown summary reports.
 - Provides runnable Python scripts that turn parsed parameters into repeatable execution steps.
 
@@ -37,7 +35,7 @@ It is especially useful for people who want to:
 ### Requirements
 
 - Python 3.10 or newer.
-- Internet access to retrieve quote data from Yahoo Finance.
+- Internet access to retrieve daily closing-price history from Yahoo Finance.
 - Write access to the project directory for the SQLite database.
 
 The current command-line script uses only the Python standard library; no package installation is required.
@@ -54,13 +52,19 @@ The database is created at `.state/stock_market_watcher.db`; runtime data is exc
 
 ### Fetch and store a price snapshot
 
-Fetch daily closing prices for the last calendar month ending today (the default) and append them to the database:
+Fetch Yahoo Finance daily closing prices for the last calendar month ending today (the default) and append them to the database:
 
 ```bash
 python3 scripts/stock_watcher.py price --brand "Microsoft"
 ```
 
-Each successful `price` command stores the available daily closes in `snapshots`, linked to the company and Yahoo Finance source, with both the capture time and the market's observation time. Previous snapshots are retained. The command prints the net price and percentage change between the first and last available closes, along with significant moves and any related news headlines, source-provided summaries, publication timing, and cautious relevance context for the Codex conversation. It writes an initial Markdown report in `reports/` with date coverage, price metrics, every retrieved close, and available details for each related article. When run through the Codex skill, the report is then enriched with roughly two to three paragraphs of source-verified detail for each news item presented in the conversation; the standalone script only has access to source-provided article summaries. For each of the top three close-to-close moves, the script searches **Yahoo Finance only** for ticker-and-date news, then retries by ticker and company name if needed. It prefers articles published within three days of a move and otherwise reports the closest Yahoo Finance result. Yahoo Finance is the sole news-discovery source; its results may link to articles from other publishers, whose publisher attribution is retained. Returned articles and their source links are included in the report and stored in `news_items`. The report distinguishes possible context from proven causation and explicitly notes when no article is returned or news lookup fails. An internet connection is required. See [references/yahoo-finance-news.md](references/yahoo-finance-news.md) for source details.
+Each successful `price` command stores completed Yahoo Finance regular-session daily closes in `snapshots`, linked to the company and source. `exchange_session_date` records the exchange-local date of the close, while `captured_at` records when the script retrieved it; for a weekend run, Friday's session date is stored separately from Saturday's or Sunday's capture timestamp. The script omits an in-progress current-session bar. Previous observations are retained. This is a historical daily-close series only: the command does not combine it with a separate live quote or after-hours price feed. It prints the net price and percentage change between the first and last available closes, significant moves, and any related news headlines, source-provided summaries, publication timing, and cautious relevance context. It writes an initial Markdown report in `reports/` with date coverage, price metrics, every retrieved close, and available details for each related article. When run through the Codex skill, the report is then enriched with roughly two to three paragraphs of source-verified detail for each news item presented in the conversation; the standalone script only has access to source-provided article summaries. For each of the top three close-to-close moves, the script searches **Yahoo Finance only** for ticker-and-date news, then retries by ticker and company name if needed. It prefers articles published within three days of a move and otherwise reports the closest Yahoo Finance result. Yahoo Finance is the sole news-discovery source; its results may link to articles from other publishers, whose publisher attribution is retained. Returned articles and their source links are included in the report and stored in `news_items`. The report distinguishes possible context from proven causation and explicitly notes when no article is returned or news lookup fails. An internet connection is required. See [references/yahoo-finance-prices.md](references/yahoo-finance-prices.md) for price-source, retrieval, and coverage details, and [references/yahoo-finance-news.md](references/yahoo-finance-news.md) for news-source details.
+
+### Price data source, retrieval, and coverage
+
+Yahoo Finance is the sole source for the script's price series. The script resolves the requested name through Yahoo Finance's search JSON endpoint, then requests daily chart JSON for the returned equity ticker over the requested date range. It reads the ticker symbol, company name, currency and price precision metadata, chart timestamps, and daily `close` values. Those daily closes are the values stored and compared; the script does not use a separate live quote, adjusted close, or after-hours price series. See [references/yahoo-finance-prices.md](references/yahoo-finance-prices.md) for endpoint details and coverage limitations.
+
+The script does not restrict ticker results to a named exchange or independently verify listing venue. NYSE- and Nasdaq-listed equities are within the intended U.S. use case when Yahoo Finance returns usable symbols and chart history. Availability for Canadian and other international listings, OTC securities, and less-liquid tickers is not guaranteed; symbols may require Yahoo Finance's venue suffix, and price availability, currency metadata, or timing may vary. Confirm the resolved ticker and observation dates before relying on a result. Yahoo Finance data can be delayed and is not a real-time quote.
 
 Choose a different lookback in calendar months; `--fromdate` can also set the range's end date:
 
@@ -82,7 +86,7 @@ The general workflow is as follows:
 
 1. Parse the natural-language request to identify the brand, requested date range, and whether a comparison with previous snapshots is needed. If no date range is provided, use the last month.
 2. Map the brand name to its standardized stock ticker symbol (for example, Google to GOOG).
-3. Select the public market-data source for the ticker.
+3. Use Yahoo Finance to resolve the ticker and retrieve its daily closing-price history.
 4. Fetch historical daily closing prices for the requested period.
 5. Calculate trend metrics such as net price change, percentage change, and daily volatility.
 6. Store the brand, ticker, source information, and point-in-time price observations in the local SQLite database. Append new observations to the existing history rather than replacing earlier snapshots.

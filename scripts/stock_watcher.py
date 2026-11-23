@@ -13,6 +13,7 @@ from statistics import fmean, pstdev
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 # Keep runtime files beside the repository, regardless of the caller's cwd.
@@ -48,6 +49,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
     source_id INTEGER NOT NULL,
     captured_at TEXT NOT NULL,
     observed_at TEXT NOT NULL,
+    exchange_session_date TEXT NOT NULL,
     price REAL NOT NULL,
     currency TEXT NOT NULL,
     FOREIGN KEY (company_id) REFERENCES companies(company_id),
@@ -86,6 +88,20 @@ def initialize_project(project_root: Path | None = None) -> Path:
         # Enforce the foreign-key relationships defined in the schema.
         connection.execute("PRAGMA foreign_keys = ON")
         connection.executescript(SCHEMA)
+        snapshot_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(snapshots)")
+        }
+        if "exchange_session_date" not in snapshot_columns:
+            connection.execute(
+                "ALTER TABLE snapshots ADD COLUMN exchange_session_date TEXT"
+            )
+            connection.execute(
+                """
+                UPDATE snapshots
+                SET exchange_session_date = substr(observed_at, 1, 10)
+                WHERE exchange_session_date IS NULL
+                """
+            )
 
     # Return the database location for the CLI and other callers.
     return database_path
@@ -216,14 +232,49 @@ def fetch_stock_history(brand: str, start_date: date, end_date: date) -> dict:
     timestamps = results[0].get("timestamp") or []
     quote_data = results[0].get("indicators", {}).get("quote", [{}])[0]
     closes = quote_data.get("close", [])
-    observations = [
-        {
-            "price": price,
-            "observed_at": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
-        }
-        for timestamp, price in zip(timestamps, closes)
-        if isinstance(price, (int, float))
-    ]
+    timezone_name = metadata.get("exchangeTimezoneName")
+    if not timezone_name:
+        raise ValueError(
+            f"Yahoo Finance did not provide an exchange timezone for {ticker}."
+        )
+    try:
+        exchange_timezone = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError as error:
+        raise ValueError(
+            f"Yahoo Finance returned an unknown exchange timezone for {ticker}."
+        ) from error
+
+    regular_period = (
+        metadata.get("currentTradingPeriod") or {}
+    ).get("regular") or {}
+    regular_start = regular_period.get("start")
+    regular_end = regular_period.get("end")
+    current_period_date = (
+        datetime.fromtimestamp(regular_start, exchange_timezone).date()
+        if isinstance(regular_start, (int, float))
+        else datetime.now(exchange_timezone).date()
+    )
+    regular_session_open = (
+        not isinstance(regular_end, (int, float))
+        or datetime.now(timezone.utc)
+        < datetime.fromtimestamp(regular_end, timezone.utc)
+    )
+    observations = []
+    for timestamp, price in zip(timestamps, closes):
+        if not isinstance(price, (int, float)):
+            continue
+        session_date = datetime.fromtimestamp(timestamp, exchange_timezone).date()
+        if regular_session_open and session_date == current_period_date:
+            continue
+        observations.append(
+            {
+                "price": price,
+                "observed_at": datetime.fromtimestamp(
+                    timestamp, timezone.utc
+                ).isoformat(),
+                "exchange_session_date": session_date.isoformat(),
+            }
+        )
     if not observations:
         raise ValueError(f"No historical closing prices are available for {ticker}.")
 
@@ -239,7 +290,7 @@ def fetch_stock_history(brand: str, start_date: date, end_date: date) -> dict:
 
 def significant_moves(quote: dict) -> list[dict]:
     """Return the largest daily close-to-close moves, up to a fixed limit."""
-    observations = sorted(quote["observations"], key=lambda item: item["observed_at"])
+    observations = sorted(quote["observations"], key=observation_session_date)
     moves = []
     for previous, current in zip(observations, observations[1:]):
         if not previous["price"]:
@@ -256,6 +307,13 @@ def significant_moves(quote: dict) -> list[dict]:
         )
     moves.sort(key=lambda move: abs(move["percent_change"]), reverse=True)
     return moves[:TOP_PRICE_CHANGE_COUNT]
+
+
+def observation_session_date(observation: dict) -> str:
+    """Return the exchange-local session date, with legacy quote compatibility."""
+    if "exchange_session_date" in observation:
+        return observation["exchange_session_date"]
+    return datetime.fromisoformat(observation["observed_at"]).date().isoformat()
 
 
 def parse_news_date(value: object) -> datetime | None:
@@ -475,14 +533,16 @@ def store_snapshot(quote: dict, database_path: Path) -> int:
         cursor = connection.execute(
             """
             INSERT INTO snapshots (
-                company_id, source_id, captured_at, observed_at, price, currency
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                company_id, source_id, captured_at, observed_at,
+                exchange_session_date, price, currency
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 company_id,
                 source_id,
                 captured_at,
                 quote["observed_at"],
+                observation_session_date(quote),
                 quote["price"],
                 quote["currency"],
             ),
@@ -540,8 +600,8 @@ def format_quote(quote: dict) -> str:
     last = quote["observations"][-1]
     net_change = last["price"] - first["price"]
     percent_change = net_change / first["price"] * 100 if first["price"] else 0
-    start_text = datetime.fromisoformat(first["observed_at"]).strftime("%Y-%m-%d")
-    end_text = datetime.fromisoformat(last["observed_at"]).strftime("%Y-%m-%d")
+    start_text = observation_session_date(first)
+    end_text = observation_session_date(last)
     return (
         f"{quote['company']} ({quote['ticker']}): net change "
         f"{net_change:+,.{precision}f} {quote['currency']} ({percent_change:+.2f}%) "
@@ -559,9 +619,7 @@ def format_move_news(
     """Format significant moves and related-news context for the CLI conversation."""
     lines = []
     for move in moves:
-        move_date = datetime.fromisoformat(
-            move["current"]["observed_at"]
-        ).date()
+        move_date = date.fromisoformat(observation_session_date(move["current"]))
         move_date_text = move_date.isoformat()
         lines.append(
             f"Significant move on {move_date_text}: "
@@ -621,7 +679,9 @@ def write_report(
     precision = quote["price_hint"]
     if not isinstance(precision, int) or not 0 <= precision <= 8:
         precision = 2
-    observations = sorted(quote["observations"], key=lambda item: item["observed_at"])
+    observations = sorted(
+        quote["observations"], key=observation_session_date
+    )
     first = observations[0]
     last = observations[-1]
     net_change = last["price"] - first["price"]
@@ -640,7 +700,7 @@ def write_report(
         return f"{value:,.{precision}f} {quote['currency']}"
 
     def observed_date(observation: dict) -> str:
-        return datetime.fromisoformat(observation["observed_at"]).strftime("%Y-%m-%d")
+        return observation_session_date(observation)
 
     lines = [
         f"# {quote['company']} ({quote['ticker']}) stock performance",
@@ -724,9 +784,9 @@ def write_report(
                     lines.append(
                         f"  - {escape_markdown_text(article['summary'])}"
                     )
-                move_day = datetime.fromisoformat(
-                    move["current"]["observed_at"]
-                ).date()
+                move_day = date.fromisoformat(
+                    observation_session_date(move["current"])
+                )
                 article_day = datetime.fromisoformat(
                     article["published_at"]
                 ).date()
@@ -814,9 +874,9 @@ def main() -> int:
             news_by_move = {}
             news_errors = {}
             for move in moves:
-                move_date = datetime.fromisoformat(
-                    move["current"]["observed_at"]
-                ).date()
+                move_date = date.fromisoformat(
+                    observation_session_date(move["current"])
+                )
                 move_date_text = move_date.isoformat()
                 try:
                     articles = fetch_related_news(
