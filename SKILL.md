@@ -18,6 +18,7 @@ When the trigger criteria are met, read the user's message and extract the compa
 Do not use this skill for non-financial questions, requests to perform trades, speculative investment advice, or requests that require detailed legal, accounting, or personalized financial guidance.
 
 ## Prerequisites & Environment
+
 - Expected working directory for the skill: skills/stock-market-watcher
 - Required runtime: Python 3.10+; use the Python standard library modules `sqlite3`, `argparse`, `json`, and `pathlib` without installing additional packages for basic persistence and file handling.
 - The current CLI uses Python's standard library to request public Yahoo Finance JSON endpoints; no browser automation or package installation is required.
@@ -44,31 +45,65 @@ Trigger this workflow when the user asks for a company's stock value, recent mar
 7. Before presenting the result, enrich that generated report for every news item included in the Codex response. Open the linked public article when accessible and write a fact-grounded, roughly 2-3 paragraph summary under that article in the report. Explain the reported development and relevant context from the article, then describe cautiously how its topic and publication timing may relate to the price move. Do not infer facts from a headline alone, invent details, or claim causation. Preserve the article link and any source-provided summary. If the article cannot be accessed or does not contain enough information for a detailed account, state that limitation and summarize only what is verifiable rather than padding the report.
 8. Present a concise summary of the relevant news in the Codex conversation, consistent with the detailed report summaries. Be clear that temporal association is not proof of causation. State the actual observation dates, price currency, and Yahoo Finance as the source; identify the values as historical closing prices.
 
-### Compare snapshots
+### Summarize a stock period
 
-Trigger this workflow when the user asks how a company's stock changed over a date range or between two snapshots or time points.
+Trigger this workflow for phrases such as “summarize Apple’s stock over the last month,” “show Microsoft’s price trend,” or “compare the recent closes for GOOG.” This is a read-and-report operation; it does not add the symbol to the watch registry.
 
-1. For a requested date range, follow the historical-price workflow above. For a comparison of saved snapshots, identify the requested points and use stored observations where available.
-2. If a requested stored observation is missing, fetch historical data from a public source and save it before comparing.
-3. Calculate absolute and percentage price change between the selected observations, retaining their dates and source details.
-4. Present the result and source to the user, and write a Markdown report in `reports/`.
+1. Resolve the requested brand or ticker through Yahoo Finance.
+2. Fetch completed regular-session daily closes for the requested range.
+3. Append every observation to `snapshots` and generate the normal Markdown report.
+4. Search and associate Yahoo Finance news for the largest moves, if requested by the normal workflow.
+5. Do not create or update a `watched_symbols` row for summarization requests.
 
-`README.md` contains the project overview and setup guidance. `scripts/stock_watcher.py` initializes the local database and fetches and stores historical closing prices with the `price` command. `references/` is reserved for static source guidance, and `agents/openai.yaml` contains agent metadata.
+Run this directly with:
+
+```bash
+python3 scripts/stock_watcher.py summarize --brand "Apple" --months 1
+```
+
+The legacy `price` command remains available as an alias for `summarize`; it also does not modify the watch registry.
+
+### Watch or track a brand
+
+Trigger this workflow only when the user explicitly requests ongoing tracking, such as “watch Apple,” “track MSFT,” or “add Nvidia to my watched stocks.”
+
+1. Resolve the brand through Yahoo Finance’s public search response.
+2. Present the resolved company name and ticker to the user and require explicit confirmation before adding it.
+3. Call the watch command with the confirmed ticker. The symbol is written only if the confirmed ticker exactly matches Yahoo Finance’s resolved ticker.
+4. Watch mode updates `watched_symbols` only. It does not fetch a chart, create price snapshots, fetch news, or generate a report.
+
+```bash
+python3 scripts/stock_watcher.py watch --brand "Apple" --confirmed-ticker "AAPL"
+```
+
+Summaries and snapshot fetches must never imply that a stock is being watched. Conversely, a watch request must not silently generate or append historical snapshots.
+
+### Watchlist checks
+
+Use `watch-check --brand "Apple"` to check an active watched symbol. The default threshold is 3%; pass `--threshold-percent` to override it.
+
+- A watched symbol begins with `baseline_price` and `baseline_session_date` set to NULL.
+- The first successful check saves the latest completed regular-session close and its exchange date as the baseline. It never triggers an alert.
+- If the first fetch fails, both baseline fields remain NULL so the next check may establish them.
+- For later checks, calculate signed net change and percentage change from the baseline.
+- Trigger a flag only when the percentage is strictly greater than `+threshold` or strictly less than `-threshold`; exactly matching the threshold does not flag.
+- Update the baseline only when the latest session date differs from `baseline_session_date` and the prices are comparable.
+- Unadjusted comparisons across a stock split are skipped rather than used for an alert or baseline update.
 
 ## SQLite Schema
 
 Define these tables in `.state/stock_market_watcher.db`:
 
 - `companies(company_id, name, ticker, created_at)`
-- `sources(source_id, name, url)`
-- `snapshots(snapshot_id, company_id, source_id, captured_at, observed_at, exchange_session_date, price, currency)`
-- `news_items(news_id, snapshot_id, source_id, published_at, title, url, summary)`
+- `snapshots(snapshot_id, company_id, captured_at, observed_at, exchange_session_date, price, currency, price_basis)`
+- `news_items(news_id, snapshot_id, published_at, title, url, summary)`
+- `watched_symbols(watch_id, company_id, ticker, added_at, active, baseline_price, baseline_session_date)`
 
 Each `snapshots` row represents one price observation. `exchange_session_date` is the exchange-local calendar date on which the regular session closed; `captured_at` is the UTC timestamp when the script retrieved and stored the snapshot. `observed_at` retains the provider's source timestamp for compatibility and traceability. On weekends, the latest session date will normally be the previous Friday, while `captured_at` records the actual weekend retrieval time. Existing databases are migrated by deriving the new session-date field from their stored provider timestamp.
 
 ## Output
 
-- SQLite database: `.state/stock_market_watcher.db` for timestamped stock observations and source details. Create `.state/` if it does not exist.
+- SQLite database: `.state/stock_market_watcher.db` for timestamped stock observations and watch registrations. Create `.state/` if it does not exist.
 - Markdown report: a generated report file in `reports/`, named `[ticker-name]_[current date in YYYYMMDD].md` (for example, `AAPL_20261122.md`). Create `reports/` if it does not exist.
 - These are runtime output files and must not be tracked or committed in git.
 
@@ -79,3 +114,5 @@ Each `snapshots` row represents one price observation. `exchange_session_date` i
 - Limit local writes to appending observations to `.state/stock_market_watcher.db` and creating reports under `reports/`. Never stage, commit, or otherwise track these outputs in git, and do not overwrite or delete prior observations.
 - Include the source, exchange session date, and capture time for reported prices; distinguish delayed or historical data from live data. Do not infer missing values or present estimates as confirmed facts.
 - Clearly report unavailable, ambiguous, or incomplete data; never fabricate results or present failed fetches as successful. Keep conclusions factual, not personalized financial advice or buy/sell recommendations.
+
+`price_basis` has exactly two values: `split-adjusted` or `unadjusted`. Yahoo Finance chart `close` values are stored as `unadjusted` raw closes. For unadjusted data, net or percentage comparisons spanning an identified stock split are omitted and explicitly reported as incomparable. A split-adjusted series may be compared consistently and must state that basis in the report.

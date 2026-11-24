@@ -25,7 +25,7 @@ TOP_PRICE_CHANGE_COUNT = 3
 NEWS_DATE_WINDOW_DAYS = 3
 
 
-# Create the tables used for companies, data sources, price snapshots, and news.
+# Create the tables used for companies, price snapshots, news, and watched symbols.
 SCHEMA = """
 -- Store each tracked company and its unique ticker.
 CREATE TABLE IF NOT EXISTS companies (
@@ -35,38 +35,43 @@ CREATE TABLE IF NOT EXISTS companies (
     created_at TEXT NOT NULL
 );
 
--- Record the public sources used to retrieve prices or news.
-CREATE TABLE IF NOT EXISTS sources (
-    source_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    url TEXT NOT NULL UNIQUE
-);
-
--- Keep timestamped price observations linked to their company and source.
+-- Keep timestamped price observations linked to their company.
 CREATE TABLE IF NOT EXISTS snapshots (
     snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
     company_id INTEGER NOT NULL,
-    source_id INTEGER NOT NULL,
     captured_at TEXT NOT NULL,
     observed_at TEXT NOT NULL,
     exchange_session_date TEXT NOT NULL,
     price REAL NOT NULL,
     currency TEXT NOT NULL,
+    price_basis TEXT NOT NULL DEFAULT 'unadjusted'
+        CHECK (price_basis IN ('split-adjusted', 'unadjusted')),
     FOREIGN KEY (company_id) REFERENCES companies(company_id),
-    FOREIGN KEY (source_id) REFERENCES sources(source_id)
+    UNIQUE(company_id, exchange_session_date, currency, price_basis)
 );
 
--- Associate published news items with the snapshot and source they support.
+-- Associate published news items with Yahoo-linked snapshots.
 CREATE TABLE IF NOT EXISTS news_items (
     news_id INTEGER PRIMARY KEY AUTOINCREMENT,
     snapshot_id INTEGER NOT NULL,
-    source_id INTEGER NOT NULL,
     published_at TEXT,
     title TEXT NOT NULL,
     url TEXT NOT NULL,
     summary TEXT,
-    FOREIGN KEY (snapshot_id) REFERENCES snapshots(snapshot_id),
-    FOREIGN KEY (source_id) REFERENCES sources(source_id)
+    FOREIGN KEY (snapshot_id) REFERENCES snapshots(snapshot_id)
+);
+
+-- Symbols explicitly requested for ongoing tracking. Summaries do not write here.
+CREATE TABLE IF NOT EXISTS watched_symbols (
+    watch_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    company_id INTEGER NOT NULL,
+    ticker TEXT NOT NULL,
+    added_at TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    baseline_price REAL,
+    baseline_session_date TEXT,
+    UNIQUE(ticker),
+    FOREIGN KEY (company_id) REFERENCES companies(company_id)
 );
 """
 
@@ -85,9 +90,23 @@ def initialize_project(project_root: Path | None = None) -> Path:
     # Create missing tables without replacing any existing database contents.
     database_path = state_dir / DATABASE_NAME
     with closing(sqlite3.connect(database_path)) as connection, connection:
-        # Enforce the foreign-key relationships defined in the schema.
-        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA foreign_keys = OFF")
         connection.executescript(SCHEMA)
+        for table_name in ("snapshots", "news_items", "watched_symbols"):
+            exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table_name,),
+            ).fetchone()
+            if exists:
+                columns = {
+                    row[1]
+                    for row in connection.execute(f"PRAGMA table_info({table_name})")
+                }
+                if "source_id" in columns:
+                    connection.execute(f"ALTER TABLE {table_name} DROP COLUMN source_id")
+        connection.execute("DROP TABLE IF EXISTS sources")
+        connection.execute("PRAGMA foreign_keys = ON")
+
         snapshot_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(snapshots)")
         }
@@ -102,6 +121,37 @@ def initialize_project(project_root: Path | None = None) -> Path:
                 WHERE exchange_session_date IS NULL
                 """
             )
+        if "price_basis" not in snapshot_columns:
+            connection.execute(
+                "ALTER TABLE snapshots ADD COLUMN price_basis TEXT "
+                "NOT NULL DEFAULT 'unadjusted' "
+                "CHECK (price_basis IN ('split-adjusted', 'unadjusted'))"
+            )
+
+        watch_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(watched_symbols)")
+        }
+        if "baseline_price" not in watch_columns:
+            connection.execute("ALTER TABLE watched_symbols ADD COLUMN baseline_price REAL")
+        if "baseline_session_date" not in watch_columns:
+            connection.execute("ALTER TABLE watched_symbols ADD COLUMN baseline_session_date TEXT")
+
+        connection.execute(
+            """
+            DELETE FROM snapshots
+            WHERE snapshot_id NOT IN (
+                SELECT MIN(snapshot_id)
+                FROM snapshots
+                GROUP BY company_id, exchange_session_date, currency, price_basis
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_snapshots_one_per_session
+            ON snapshots(company_id, exchange_session_date, currency, price_basis)
+            """
+        )
 
     # Return the database location for the CLI and other callers.
     return database_path
@@ -117,6 +167,32 @@ def build_parser() -> argparse.ArgumentParser:
         "init",
         help="initialize the .state and reports directories",
     )
+    for command_name, help_text in (
+        (
+            "summarize",
+            "fetch and report historical prices without changing the watch list",
+        ),
+        (
+            "watch",
+            "resolve and confirm a symbol, then add it to the watch registry",
+        ),
+    ):
+        command_parser = commands.add_parser(command_name, help=help_text)
+        command_parser.add_argument("--brand", required=True,
+                                    help="company or brand name (or stock ticker)")
+        command_parser.add_argument("--months", type=positive_integer, default=1,
+                                    help="number of calendar months to track (default: 1)")
+        command_parser.add_argument("--fromdate", type=parse_date,
+                                    default=datetime.now(timezone.utc).date(),
+                                    help="end date in YYYY-MM-DD format (default: today)")
+        if command_name == "watch":
+            command_parser.add_argument(
+                "--confirmed-ticker",
+                required=True,
+                help="ticker explicitly confirmed against Yahoo Finance",
+            )
+
+    # Backward-compatible alias: price performs summary only and never watches.
     price_parser = commands.add_parser(
         "price",
         help="fetch the latest available stock price for a brand or company",
@@ -138,7 +214,30 @@ def build_parser() -> argparse.ArgumentParser:
         default=datetime.now(timezone.utc).date(),
         help="end date in YYYY-MM-DD format (default: today)",
     )
+
+    check_parser = commands.add_parser(
+        "watch-check",
+        help="check a watched brand against its stored baseline",
+    )
+    check_parser.add_argument("--brand", required=True,
+                              help="watched company or brand name (or ticker)")
+    check_parser.add_argument("--threshold-percent", type=percentage,
+                              default=3.0,
+                              help="strict absolute percentage threshold (default: 3.0)")
     return parser
+
+
+def percentage(value: str) -> float:
+    """Parse a finite, non-negative percentage threshold."""
+    try:
+        number = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a number") from error
+    if number != number or number in (float("inf"), float("-inf")):
+        raise argparse.ArgumentTypeError("must be finite")
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be greater than or equal to zero")
+    return number
 
 
 def positive_integer(value: str) -> int:
@@ -198,27 +297,14 @@ def fetch_json(url: str) -> dict:
 
 def fetch_stock_history(brand: str, start_date: date, end_date: date) -> dict:
     """Resolve a brand and return daily closes within the requested date range."""
-    search_url = "https://query1.finance.yahoo.com/v1/finance/search?" + urlencode(
-        {"q": brand, "quotesCount": 10, "newsCount": 0}
-    )
-    search_data = fetch_json(search_url)
-    quotes = search_data.get("quotes", [])
-    equity_matches = [
-        quote
-        for quote in quotes
-        if quote.get("quoteType") == "EQUITY" and quote.get("symbol")
-    ]
-    if not equity_matches:
-        raise ValueError(f"No publicly traded stock was found for {brand!r}.")
-
-    match = equity_matches[0]
-    ticker = match["symbol"]
+    resolved = resolve_equity(brand)
+    ticker = resolved["ticker"]
     period1 = int(datetime.combine(start_date, time.min, timezone.utc).timestamp())
     period2 = int(
         datetime.combine(end_date + timedelta(days=1), time.min, timezone.utc).timestamp()
     )
     chart_url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?" + urlencode(
-        {"period1": period1, "period2": period2, "interval": "1d"}
+        {"period1": period1, "period2": period2, "interval": "1d", "events": "splits"}
     )
     chart_data = fetch_json(chart_url)
     chart = chart_data.get("chart", {})
@@ -273,6 +359,7 @@ def fetch_stock_history(brand: str, start_date: date, end_date: date) -> dict:
                     timestamp, timezone.utc
                 ).isoformat(),
                 "exchange_session_date": session_date.isoformat(),
+                "price_basis": "unadjusted",
             }
         )
     if not observations:
@@ -284,8 +371,34 @@ def fetch_stock_history(brand: str, start_date: date, end_date: date) -> dict:
         "company": metadata.get("longName") or metadata.get("shortName") or brand,
         "currency": metadata.get("currency") or "UNKNOWN",
         "price_hint": metadata.get("priceHint", 2),
+        "price_basis": "unadjusted",
+        "split_dates": extract_split_dates(results[0]),
         "observations": observations,
     }
+
+
+def extract_split_dates(chart_result: dict) -> list[str]:
+    """Return split event dates from a Yahoo chart result."""
+    events = chart_result.get("events") or {}
+    splits = events.get("splits") or {}
+    dates = []
+    for value in splits.values() if isinstance(splits, dict) else []:
+        timestamp = value.get("date") if isinstance(value, dict) else None
+        if isinstance(timestamp, (int, float)):
+            dates.append(datetime.fromtimestamp(timestamp, timezone.utc).date().isoformat())
+    return sorted(set(dates))
+
+
+def comparison_is_valid(quote: dict, first: dict, last: dict) -> bool:
+    """Reject comparisons across split events for unadjusted closes."""
+    if quote.get("price_basis") == "split-adjusted":
+        return True
+    start = date.fromisoformat(observation_session_date(first))
+    end = date.fromisoformat(observation_session_date(last))
+    return not any(
+        start < date.fromisoformat(split_date) <= end
+        for split_date in quote.get("split_dates", [])
+    )
 
 
 def significant_moves(quote: dict) -> list[dict]:
@@ -294,6 +407,12 @@ def significant_moves(quote: dict) -> list[dict]:
     moves = []
     for previous, current in zip(observations, observations[1:]):
         if not previous["price"]:
+            continue
+        pair_quote = {
+            "price_basis": quote.get("price_basis", "unadjusted"),
+            "split_dates": quote.get("split_dates", []),
+        }
+        if not comparison_is_valid(pair_quote, previous, current):
             continue
         change = current["price"] - previous["price"]
         percent_change = change / previous["price"] * 100
@@ -504,8 +623,6 @@ def fetch_related_news(
 def store_snapshot(quote: dict, database_path: Path) -> int:
     """Append a quote to the database and return its snapshot ID."""
     captured_at = datetime.now(timezone.utc).isoformat()
-    source_name = "Yahoo Finance"
-    source_url = "https://query1.finance.yahoo.com/"
 
     with closing(sqlite3.connect(database_path)) as connection, connection:
         connection.execute("PRAGMA foreign_keys = ON")
@@ -521,28 +638,30 @@ def store_snapshot(quote: dict, database_path: Path) -> int:
             "SELECT company_id FROM companies WHERE ticker = ?",
             (quote["ticker"],),
         ).fetchone()[0]
-        connection.execute(
-            "INSERT INTO sources (name, url) VALUES (?, ?) "
-            "ON CONFLICT(url) DO UPDATE SET name = excluded.name",
-            (source_name, source_url),
-        )
-        source_id = connection.execute(
-            "SELECT source_id FROM sources WHERE url = ?",
-            (source_url,),
-        ).fetchone()[0]
+        session_date = observation_session_date(quote)
+        existing = connection.execute(
+            """
+            SELECT snapshot_id FROM snapshots
+            WHERE company_id = ? AND exchange_session_date = ?
+              AND currency = ? AND price_basis = 'unadjusted'
+            """,
+            (company_id, session_date, quote["currency"]),
+        ).fetchone()
+        if existing:
+            return existing[0]
+
         cursor = connection.execute(
             """
             INSERT INTO snapshots (
-                company_id, source_id, captured_at, observed_at,
-                exchange_session_date, price, currency
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                company_id, captured_at, observed_at,
+                exchange_session_date, price, currency, price_basis
+            ) VALUES (?, ?, ?, ?, ?, ?, 'unadjusted')
             """,
             (
                 company_id,
-                source_id,
                 captured_at,
                 quote["observed_at"],
-                observation_session_date(quote),
+                session_date,
                 quote["price"],
                 quote["currency"],
             ),
@@ -553,35 +672,70 @@ def store_snapshot(quote: dict, database_path: Path) -> int:
 def store_news_item(
     article: dict, snapshot_id: int, database_path: Path
 ) -> None:
-    """Append a related article and its source to the local database."""
-    source_name = "Yahoo Finance News"
-    source_url = "https://query1.finance.yahoo.com/v1/finance/search"
+    """Append a Yahoo Finance news item linked to a snapshot."""
     with closing(sqlite3.connect(database_path)) as connection, connection:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(
-            "INSERT INTO sources (name, url) VALUES (?, ?) "
-            "ON CONFLICT(url) DO UPDATE SET name = excluded.name",
-            (source_name, source_url),
-        )
-        source_id = connection.execute(
-            "SELECT source_id FROM sources WHERE url = ?",
-            (source_url,),
-        ).fetchone()[0]
-        connection.execute(
             """
             INSERT INTO news_items (
-                snapshot_id, source_id, published_at, title, url, summary
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                snapshot_id, published_at, title, url, summary
+            ) VALUES (?, ?, ?, ?, ?)
             """,
             (
                 snapshot_id,
-                source_id,
                 article["published_at"],
                 article["title"],
                 article["url"],
                 article["summary"],
             ),
         )
+
+
+def add_watched_symbol(quote: dict, confirmed_ticker: str, database_path: Path) -> dict:
+    """Add an explicitly confirmed Yahoo Finance symbol to the watch registry."""
+    resolved_ticker = str(quote["ticker"]).upper()
+    confirmed_ticker = confirmed_ticker.strip().upper()
+    if confirmed_ticker != resolved_ticker:
+        raise ValueError(
+            f"Confirmation mismatch: Yahoo Finance resolved {quote['brand']!r} "
+            f"to {resolved_ticker}, not {confirmed_ticker}."
+        )
+
+    captured_at = datetime.now(timezone.utc).isoformat()
+    with closing(sqlite3.connect(database_path)) as connection, connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute(
+            """
+            INSERT INTO companies (name, ticker, created_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(ticker) DO UPDATE SET name = excluded.name
+            """,
+            (quote["company"], resolved_ticker, captured_at),
+        )
+        company_id = connection.execute(
+            "SELECT company_id FROM companies WHERE ticker = ?", (resolved_ticker,)
+        ).fetchone()[0]
+        connection.execute(
+            "INSERT INTO watched_symbols (company_id, ticker, added_at, active) "
+            "VALUES (?, ?, ?, 1) "
+            "ON CONFLICT(ticker) DO UPDATE SET "
+            "company_id = excluded.company_id, active = 1",
+            (company_id, resolved_ticker, captured_at),
+        )
+        row = connection.execute(
+            """
+            SELECT watch_id, ticker, added_at, active
+            FROM watched_symbols WHERE ticker = ?
+            """,
+            (resolved_ticker,),
+        ).fetchone()
+    return {
+        "watch_id": row[0],
+        "ticker": row[1],
+        "added_at": row[2],
+        "active": bool(row[3]),
+        "company": quote["company"],
+    }
 
 
 def escape_markdown_text(value: str) -> str:
@@ -592,260 +746,302 @@ def escape_markdown_text(value: str) -> str:
 
 
 def format_quote(quote: dict) -> str:
-    """Format the requested period's price change for display."""
+    """Format the period summary, skipping comparisons across splits."""
     precision = quote["price_hint"]
     if not isinstance(precision, int) or not 0 <= precision <= 8:
         precision = 2
-    first = quote["observations"][0]
-    last = quote["observations"][-1]
-    net_change = last["price"] - first["price"]
-    percent_change = net_change / first["price"] * 100 if first["price"] else 0
+    observations = sorted(quote["observations"], key=observation_session_date)
+    first = observations[0]
+    last = observations[-1]
+    basis = quote.get("price_basis", "unadjusted")
     start_text = observation_session_date(first)
     end_text = observation_session_date(last)
+    if not comparison_is_valid(quote, first, last):
+        split_text = ", ".join(quote.get("split_dates", [])) or "a stock split"
+        return (
+            f"{quote['company']} ({quote['ticker']}): price comparison skipped "
+            f"because the unadjusted series spans {split_text}; "
+            f"period {start_text} to {end_text}; {len(observations)} daily closes "
+            f"(price basis: {basis}; source: Yahoo Finance)"
+        )
+    net_change = last["price"] - first["price"]
+    percent_change = net_change / first["price"] * 100 if first["price"] else 0
     return (
         f"{quote['company']} ({quote['ticker']}): net change "
         f"{net_change:+,.{precision}f} {quote['currency']} ({percent_change:+.2f}%) "
-        f"from {start_text} to {end_text}; "
-        f"{len(quote['observations'])} daily closing prices (source: Yahoo Finance)"
+        f"from {start_text} to {end_text}; {len(observations)} daily closing prices "
+        f"(price basis: {basis}; source: Yahoo Finance)"
     )
 
 
-def format_move_news(
-    quote: dict,
-    moves: list[dict],
-    news_by_move: dict[str, list[dict]],
-    news_errors: dict[str, str],
-) -> list[str]:
-    """Format significant moves and related-news context for the CLI conversation."""
+def format_move_news(quote, moves, news_by_move, news_errors):
+    """Format significant moves and related news for CLI output."""
     lines = []
     for move in moves:
         move_date = date.fromisoformat(observation_session_date(move["current"]))
-        move_date_text = move_date.isoformat()
         lines.append(
-            f"Significant move on {move_date_text}: "
+            f"Significant move on {move_date.isoformat()}: "
             f"{move['percent_change']:+.2f}% "
             f"({move['change']:+,.2f} {quote['currency']})."
         )
-        if move_date_text in news_errors:
-            lines.append(f"  Related news lookup failed: {news_errors[move_date_text]}")
-            continue
-        articles = news_by_move.get(move_date_text, [])
-        if not articles:
+        if move_date.isoformat() in news_errors:
             lines.append(
-                "  No related news article was returned by Yahoo Finance."
+                f"  Related news lookup failed: "
+                f"{news_errors[move_date.isoformat()]}"
             )
-            continue
-        for article in articles:
-            published_date = datetime.fromisoformat(
-                article["published_at"]
-            ).date()
-            offset = (published_date - move_date).days
-            timing = (
-                "on the move date"
-                if offset == 0
-                else f"{abs(offset)} day(s) "
-                f"{'after' if offset > 0 else 'before'} the move"
-            )
-            association = (
-                f"Yahoo tags it to {quote['ticker']}"
-                if quote["ticker"].upper() in article["related_tickers"]
-                else f"Yahoo Finance returned it for a {quote['ticker']} news search"
-            )
-            if abs(offset) > NEWS_DATE_WINDOW_DAYS:
-                association = f"closest available result; {association}"
-            lines.append(
-                f"  News: {article['title']} "
-                f"({article['publisher']}, {published_date.isoformat()})"
-            )
-            if article.get("summary"):
-                lines.append(f"  Summary: {article['summary']}")
-            lines.append(
-                f"  Why related: {association}; it was published {timing}. "
-                "This is potential context, not proof of causation."
-            )
+        else:
+            articles = news_by_move.get(move_date.isoformat(), [])
+            if not articles:
+                lines.append("  No related news article was returned by Yahoo Finance.")
+            for article in articles:
+                published_date = datetime.fromisoformat(article["published_at"]).date()
+                lines.append(
+                    f"  News: {article['title']} "
+                    f"({article['publisher']}, {published_date.isoformat()})"
+                )
+                if article.get("summary"):
+                    lines.append(f"  Summary: {article['summary']}")
+                offset = (published_date - move_date).days
+                timing = (
+                    "on the move date" if offset == 0
+                    else f"{abs(offset)} day(s) {'after' if offset > 0 else 'before'} the move"
+                )
+                association = (
+                    f"Yahoo tags it to {quote['ticker']}"
+                    if quote["ticker"].upper() in article["related_tickers"]
+                    else f"Yahoo Finance returned it for a {quote['ticker']} news search"
+                )
+                if abs(offset) > NEWS_DATE_WINDOW_DAYS:
+                    association = f"closest available result; {association}"
+                lines.append(
+                    f"  Why related: {association}; it was published {timing}. "
+                    "This is potential context, not proof of causation."
+                )
     return lines
 
 
-def write_report(
-    quote: dict,
-    report_dir: Path,
-    requested_start: date,
-    requested_end: date,
-    moves: list[dict] | None = None,
-    news_by_move: dict[str, list[dict]] | None = None,
-    news_errors: dict[str, str] | None = None,
-) -> Path:
-    """Write a Markdown summary of price performance and related news."""
+def write_report(quote, report_dir, requested_start, requested_end,
+                moves=None, news_by_move=None, news_errors=None):
+    """Write a split-aware Markdown stock performance report."""
     precision = quote["price_hint"]
     if not isinstance(precision, int) or not 0 <= precision <= 8:
         precision = 2
-    observations = sorted(
-        quote["observations"], key=observation_session_date
-    )
+    observations = sorted(quote["observations"], key=observation_session_date)
     first = observations[0]
     last = observations[-1]
-    net_change = last["price"] - first["price"]
-    percent_change = net_change / first["price"] * 100 if first["price"] else None
-    highest = max(observations, key=lambda item: item["price"])
-    lowest = min(observations, key=lambda item: item["price"])
-    daily_returns = []
-    for previous, current in zip(observations, observations[1:]):
-        if previous["price"]:
-            daily_returns.append(
-                (current["price"] - previous["price"]) / previous["price"] * 100
-            )
-    volatility = pstdev(daily_returns) if len(daily_returns) > 1 else None
-
-    def price_text(value: float) -> str:
-        return f"{value:,.{precision}f} {quote['currency']}"
-
-    def observed_date(observation: dict) -> str:
-        return observation_session_date(observation)
+    basis = quote.get("price_basis", "unadjusted")
+    comparable = comparison_is_valid(quote, first, last)
+    net_change = last["price"] - first["price"] if comparable else None
+    percent_change = net_change / first["price"] * 100 if comparable and net_change is not None and first["price"] else None
+    split_dates = ", ".join(quote.get("split_dates", []))
 
     lines = [
         f"# {quote['company']} ({quote['ticker']}) stock performance",
         "",
         f"- Requested period: {requested_start.isoformat()} to {requested_end.isoformat()}",
-        f"- Available data: {observed_date(first)} to {observed_date(last)}",
-        f"- Source: Yahoo Finance historical daily closing prices",
-        f"- Observations: {len(observations)} daily closes",
+        f"- Available data: {observation_session_date(first)} to {observation_session_date(last)}",
+        f"- Price basis: {basis}",
+        "- Price basis note: unadjusted means Yahoo Finance raw closes; split-adjusted means historical closes are aligned for splits.",
+        "- Source: Yahoo Finance historical daily closing prices",
         "",
         "## Summary Metrics",
         "",
-        f"- Starting close ({observed_date(first)}): {price_text(first['price'])}",
-        f"- Ending close ({observed_date(last)}): {price_text(last['price'])}",
-        f"- Net change: {price_text(last['price'])} - {price_text(first['price'])} = "
-        f"{net_change:+,.{precision}f} {quote['currency']}",
-        (
-            f"- Percentage change: ({net_change:+,.{precision}f} / "
-            f"{first['price']:,.{precision}f}) * 100 = {percent_change:+.2f}%"
-            if percent_change is not None
-            else "- Percentage change: N/A (starting close is zero)"
-        ),
-        f"- Highest close: {price_text(highest['price'])} ({observed_date(highest)})",
-        f"- Lowest close: {price_text(lowest['price'])} ({observed_date(lowest)})",
-        f"- Mean close: {price_text(fmean(item['price'] for item in observations))}",
-        (
-            f"- Daily return volatility (population standard deviation): {volatility:.2f}%"
-            if volatility is not None
-            else "- Daily return volatility: N/A (fewer than two daily returns)"
-        ),
-        "",
-        f"## Top {TOP_PRICE_CHANGE_COUNT} Daily Price Changes",
-        "",
+        f"- Starting close ({observation_session_date(first)}): {first['price']:,.{precision}f} {quote['currency']}",
+        f"- Ending close ({observation_session_date(last)}): {last['price']:,.{precision}f} {quote['currency']}",
     ]
+    if comparable:
+        lines.extend([
+            f"- Net change: {net_change:+,.{precision}f} {quote['currency']}",
+            f"- Percentage change: {percent_change:+.2f}%",
+        ])
+    else:
+        lines.extend([
+            "- Net change: N/A - comparison skipped across a stock split",
+            "- Percentage change: N/A - not comparable across a stock split",
+            f"- Split date(s): {split_dates}",
+        ])
+
     moves = moves if moves is not None else significant_moves(quote)
     news_by_move = news_by_move or {}
     news_errors = news_errors or {}
-    if not moves:
-        lines.append("No daily close-to-close price changes are available.")
+    lines.extend(["", f"## Top {len(moves)} Daily Price Changes", ""])
     for move in moves:
-        move_date = observed_date(move["current"])
-        lines.extend(
-            [
-                f"### {move_date}: {move['percent_change']:+.2f}%",
-                "",
-                f"- Close-to-close change: {move['change']:+,.{precision}f} "
-                f"{quote['currency']} "
-                f"({price_text(move['previous']['price'])} to "
-                f"{price_text(move['current']['price'])})",
-            ]
-        )
+        move_date = observation_session_date(move["current"])
+        lines.extend([
+            f"### {move_date}: {move['percent_change']:+.2f}%",
+            "",
+            f"- Close-to-close change: {move['change']:+,.{precision}f} {quote['currency']}",
+        ])
         if move_date in news_errors:
-            lines.extend(
-                [
-                    f"- Related news lookup failed: "
-                    f"{escape_markdown_text(news_errors[move_date])}",
-                ]
+            lines.append(f"- Related news lookup failed: {news_errors[move_date]}")
+        for article in news_by_move.get(move_date, []):
+            published_date = datetime.fromisoformat(article["published_at"]).strftime("%Y-%m-%d")
+            lines.append(f"- [{article['title']}]({article['url']}) - {article['publisher']}, {published_date}")
+            if article.get("summary"):
+                lines.append(f"  - {article['summary']}")
+            move_day = date.fromisoformat(move_date)
+            article_day = datetime.fromisoformat(article["published_at"]).date()
+            day_offset = (article_day - move_day).days
+            timing = (
+                "on the move date" if day_offset == 0
+                else f"{abs(day_offset)} day(s) {'after' if day_offset > 0 else 'before'} the move"
             )
-        else:
-            articles = news_by_move.get(move_date, [])
-            if not articles:
-                lines.append(
-                "- Yahoo Finance returned no related news article for this move."
-                )
-            for article in articles:
-                published_date = datetime.fromisoformat(
-                    article["published_at"]
-                ).strftime("%Y-%m-%d")
-                safe_title = escape_markdown_text(article["title"])
-                safe_publisher = escape_markdown_text(article["publisher"])
-                safe_url = (
-                    article["url"]
-                    .replace(" ", "%20")
-                    .replace("(", "%28")
-                    .replace(")", "%29")
-                )
-                lines.append(
-                    f"- [{safe_title}]({safe_url}) - {safe_publisher}, "
-                    f"{published_date}"
-                )
-                if article.get("summary"):
-                    lines.append(
-                        f"  - {escape_markdown_text(article['summary'])}"
-                    )
-                move_day = date.fromisoformat(
-                    observation_session_date(move["current"])
-                )
-                article_day = datetime.fromisoformat(
-                    article["published_at"]
-                ).date()
-                day_offset = (article_day - move_day).days
-                timing = (
-                    "on the move date"
-                    if day_offset == 0
-                    else f"{abs(day_offset)} day(s) "
-                    f"{'after' if day_offset > 0 else 'before'} the move"
-                )
-                association = (
-                    f"Yahoo tags this article to {quote['ticker']}"
-                    if quote["ticker"].upper() in article["related_tickers"]
-                    else f"Yahoo Finance returned this article for a "
-                    f"{quote['ticker']} news search"
-                )
-                if abs(day_offset) > NEWS_DATE_WINDOW_DAYS:
-                    association = f"closest available result; {association}"
-                lines.append(
-                    f"  - Why it may be related: {association}; it was published "
-                    f"{timing}. The timing/topic offer potential context, not proof "
-                    "that the article caused the price move."
-                )
+            association = (
+                f"Yahoo tags this article to {quote['ticker']}"
+                if quote["ticker"].upper() in article["related_tickers"]
+                else f"Yahoo Finance returned this article for a {quote['ticker']} news search"
+            )
+            if abs(day_offset) > NEWS_DATE_WINDOW_DAYS:
+                association = f"closest available result; {association}"
+            lines.append(
+                f"  - Why it may be related: {association}; it was published {timing}. "
+                "The timing/topic offer potential context, not proof that the article caused the price move."
+            )
         lines.append("")
 
-    lines.extend(
-        [
-            "",
-            "## Daily Closing Prices",
-            "",
-            f"| Date | Close ({quote['currency']}) | Change ({quote['currency']}) | Daily return |",
-            "| --- | ---: | ---: | ---: |",
-        ]
-    )
-    previous = None
+    lines.extend(["", "## Daily Closing Prices", "", f"| Date | Close ({quote['currency']}) |", "| --- | ---: |"])
     for observation in observations:
-        if previous is None:
-            change_text = "N/A"
-            return_text = "N/A"
-        else:
-            change = observation["price"] - previous["price"]
-            daily_return = (
-                change / previous["price"] * 100 if previous["price"] else None
-            )
-            change_text = f"{change:+,.{precision}f}"
-            return_text = f"{daily_return:+.2f}%" if daily_return is not None else "N/A"
         lines.append(
-            f"| {observed_date(observation)} | {observation['price']:,.{precision}f} "
-            f"| {change_text} | {return_text} |"
+            f"| {observation_session_date(observation)} | "
+            f"{observation['price']:,.{precision}f} |"
         )
-        previous = observation
 
     report_dir.mkdir(parents=True, exist_ok=True)
-    generated_at = datetime.now(timezone.utc)
-    report_path = report_dir / (
-        f"{quote['ticker']}_{generated_at.strftime('%Y%m%d')}.md"
-    )
+    report_path = report_dir / f"{quote['ticker']}_{datetime.now(timezone.utc).strftime('%Y%m%d')}.md"
     report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return report_path
+
+
+def resolve_equity(brand: str) -> dict:
+    """Resolve a brand or ticker to one confirmed Yahoo Finance equity."""
+    search_url = "https://query1.finance.yahoo.com/v1/finance/search?" + urlencode(
+        {"q": brand, "quotesCount": 10, "newsCount": 0}
+    )
+    search_data = fetch_json(search_url)
+    quotes = search_data.get("quotes", [])
+    equity_matches = [
+        quote
+        for quote in quotes
+        if quote.get("quoteType") == "EQUITY" and quote.get("symbol")
+    ]
+    if not equity_matches:
+        raise ValueError(f"No publicly traded stock was found for {brand!r}.")
+
+    match = equity_matches[0]
+    ticker = str(match["symbol"]).strip().upper()
+    company = (
+        match.get("longname")
+        or match.get("shortname")
+        or match.get("longName")
+        or match.get("shortName")
+        or brand
+    )
+    return {"brand": brand, "ticker": ticker, "company": company}
+
+
+def check_watched_symbol(resolved: dict, threshold_percent: float, database_path: Path) -> dict:
+    """Check a watched symbol and establish or update its session baseline."""
+    ticker = str(resolved["ticker"]).upper()
+    with closing(sqlite3.connect(database_path)) as connection:
+        row = connection.execute(
+            """
+            SELECT baseline_price, baseline_session_date
+            FROM watched_symbols
+            WHERE ticker = ? AND active = 1
+            """,
+            (ticker,),
+        ).fetchone()
+    if row is None:
+        raise ValueError(f"{ticker} is not in the active watchlist.")
+
+    quote = fetch_stock_history(
+        ticker,
+        date.today() - timedelta(days=31),
+        date.today(),
+    )
+    observations = sorted(quote["observations"], key=observation_session_date)
+    latest = observations[-1]
+    new_price = latest["price"]
+    new_session_date = observation_session_date(latest)
+    baseline_price, baseline_session_date = row
+
+    if baseline_price is None or baseline_session_date is None:
+        with closing(sqlite3.connect(database_path)) as connection, connection:
+            connection.execute(
+                """
+                UPDATE watched_symbols
+                SET baseline_price = ?, baseline_session_date = ?
+                WHERE ticker = ?
+                """,
+                (new_price, new_session_date, ticker),
+            )
+        return {
+            "baseline_established": True,
+            "flag": False,
+            "new_price": new_price,
+            "new_session_date": new_session_date,
+            "net_change": 0.0,
+            "percent_change": 0.0,
+            "threshold_percent": threshold_percent,
+        }
+
+    if baseline_session_date is not None and new_session_date == baseline_session_date:
+        return {
+            "baseline_established": False,
+            "same_session": True,
+            "flag": False,
+            "new_price": new_price,
+            "new_session_date": new_session_date,
+            "net_change": None,
+            "percent_change": None,
+            "threshold_percent": threshold_percent,
+            "reason": "no new trading session",
+        }
+
+    pair = {
+        "price_basis": "unadjusted",
+        "split_dates": quote.get("split_dates", []),
+    }
+    baseline = {
+        "price": baseline_price,
+        "exchange_session_date": baseline_session_date,
+    }
+    if not comparison_is_valid(pair, baseline, latest):
+        return {
+            "baseline_established": False,
+            "flag": False,
+            "new_price": new_price,
+            "new_session_date": new_session_date,
+            "net_change": None,
+            "percent_change": None,
+            "threshold_percent": threshold_percent,
+            "reason": "comparison skipped across a stock split",
+        }
+
+    net_change = new_price - baseline_price
+    percent_change = net_change / baseline_price * 100 if baseline_price else 0.0
+    triggered = percent_change > threshold_percent or percent_change < -threshold_percent
+
+    if new_session_date != baseline_session_date:
+        with closing(sqlite3.connect(database_path)) as connection, connection:
+            connection.execute(
+                """
+                UPDATE watched_symbols
+                SET baseline_price = ?, baseline_session_date = ?
+                WHERE ticker = ?
+                """,
+                (new_price, new_session_date, ticker),
+            )
+
+    return {
+        "baseline_established": False,
+        "flag": triggered,
+        "new_price": new_price,
+        "new_session_date": new_session_date,
+        "net_change": net_change,
+        "percent_change": percent_change,
+        "threshold_percent": threshold_percent,
+    }
 
 
 def main() -> int:
@@ -860,7 +1056,7 @@ def main() -> int:
         print(f"Initialized SQLite database at {database_path}")
         return 0
 
-    if args.command == "price":
+    if args.command in {"price", "summarize"}:
         try:
             database_path = initialize_project()
             start_date, end_date = get_date_range(args.months, args.fromdate)
@@ -913,6 +1109,59 @@ def main() -> int:
             print(f"Error: {error}", file=sys.stderr)
             return 1
         return 0
+
+    if args.command == "watch":
+        try:
+            database_path = initialize_project()
+            resolved = resolve_equity(args.brand)
+            watched = add_watched_symbol(
+                resolved, args.confirmed_ticker, database_path
+            )
+            print(
+                f"Watching {watched['company']} ({watched['ticker']}); "
+                f"Yahoo Finance confirmed the symbol."
+            )
+        except (RuntimeError, ValueError, OSError, sqlite3.Error) as error:
+            print(f"Error: {error}", file=sys.stderr)
+            return 1
+        return 0
+
+    if args.command == "watch-check":
+        try:
+            database_path = initialize_project()
+            resolved = resolve_equity(args.brand)
+            result = check_watched_symbol(
+                resolved, args.threshold_percent, database_path
+            )
+            if result["baseline_established"]:
+                print(
+                    f"Baseline established for {resolved['ticker']} at "
+                    f"{result['new_price']:.2f} on {result['new_session_date']}; "
+                    "no alert on the first check."
+                )
+            elif result["percent_change"] is None:
+                print(
+                    f"Comparison skipped for {resolved['ticker']}: "
+                    f"{result['reason']}."
+                )
+            elif result.get("same_session"):
+                print(
+                    f"No changes for {resolved['ticker']}: "
+                    f"session {result['new_session_date']} matches the baseline session."
+                )
+            else:
+                sign = "+" if result["net_change"] >= 0 else "-"
+                print(
+                    f"{resolved['ticker']} net change: {sign}{abs(result['net_change']):.2f}; "
+                    f"percent change: {sign}{abs(result['percent_change']):.2f}%; "
+                    f"threshold: {result['threshold_percent']:.2f}%; "
+                    f"session: {result['new_session_date']}; "
+                    f"flag: {'yes' if result['flag'] else 'no'}"
+                )
+            return 0
+        except (RuntimeError, ValueError, OSError, sqlite3.Error) as error:
+            print(f"Error: {error}", file=sys.stderr)
+            return 1
 
     return 2
 

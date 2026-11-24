@@ -439,19 +439,16 @@ class RelatedNewsTests(unittest.TestCase):
             stock_watcher.store_news_item(article, snapshot_id, database_path)
 
             with closing(sqlite3.connect(database_path)) as connection, connection:
-                source = connection.execute(
-                    """
-                    SELECT sources.name, sources.url
-                    FROM news_items
-                    JOIN sources USING (source_id)
-                    """
+                stored_article = connection.execute(
+                    "SELECT title, url, summary FROM news_items"
                 ).fetchone()
 
         self.assertEqual(
-            source,
+            stored_article,
             (
-                "Yahoo Finance News",
-                "https://query1.finance.yahoo.com/v1/finance/search",
+                "Company reports strong quarterly results",
+                "https://example.com/earnings",
+                "Revenue and earnings exceeded expectations.",
             ),
         )
 
@@ -502,6 +499,131 @@ class RelatedNewsTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "News searches failed"):
                 stock_watcher.fetch_related_news("ACME", self.move_date)
+
+
+class WatchRegistryTests(unittest.TestCase):
+    def test_watch_resolves_yahoo_symbol_and_adds_only_watch_registry_entry(self):
+        resolved = {
+            "brand": "Apple",
+            "ticker": "AAPL",
+            "company": "Apple Inc.",
+        }
+        with TemporaryDirectory() as directory:
+            database_path = stock_watcher.initialize_project(Path(directory))
+            watched = stock_watcher.add_watched_symbol(
+                resolved, "AAPL", database_path
+            )
+
+            with closing(sqlite3.connect(database_path)) as connection:
+                watch_count = connection.execute(
+                    "SELECT COUNT(*) FROM watched_symbols"
+                ).fetchone()[0]
+                snapshot_count = connection.execute(
+                    "SELECT COUNT(*) FROM snapshots"
+                ).fetchone()[0]
+
+        self.assertTrue(watched["active"])
+        self.assertEqual(watched["ticker"], "AAPL")
+        self.assertEqual(watch_count, 1)
+        self.assertEqual(snapshot_count, 0)
+
+    def test_watch_rejects_unconfirmed_or_mismatched_ticker(self):
+        resolved = {
+            "brand": "Apple",
+            "ticker": "AAPL",
+            "company": "Apple Inc.",
+        }
+        with TemporaryDirectory() as directory:
+            database_path = stock_watcher.initialize_project(Path(directory))
+            with self.assertRaisesRegex(ValueError, "Confirmation mismatch"):
+                stock_watcher.add_watched_symbol(
+                    resolved, "MSFT", database_path
+                )
+
+            with closing(sqlite3.connect(database_path)) as connection:
+                watch_count = connection.execute(
+                    "SELECT COUNT(*) FROM watched_symbols"
+                ).fetchone()[0]
+
+        self.assertEqual(watch_count, 0)
+
+    def test_resolve_equity_uses_yahoo_search_and_returns_first_equity(self):
+        response = {
+            "quotes": [
+                {"quoteType": "INDEX", "symbol": "^GSPC"},
+                {
+                    "quoteType": "EQUITY",
+                    "symbol": "AAPL",
+                    "longname": "Apple Inc.",
+                },
+            ]
+        }
+        with patch.object(stock_watcher, "fetch_json", return_value=response):
+            resolved = stock_watcher.resolve_equity("Apple")
+
+        self.assertEqual(resolved["ticker"], "AAPL")
+        self.assertEqual(resolved["company"], "Apple Inc.")
+
+    def test_store_snapshot_does_not_add_watched_symbol(self):
+        quote = {
+            "company": "Apple Inc.",
+            "ticker": "AAPL",
+            "currency": "USD",
+            "price": 230.0,
+            "observed_at": "2026-11-20T21:00:00+00:00",
+            "exchange_session_date": "2026-11-20",
+        }
+        with TemporaryDirectory() as directory:
+            database_path = stock_watcher.initialize_project(Path(directory))
+            stock_watcher.store_snapshot(quote, database_path)
+
+            with closing(sqlite3.connect(database_path)) as connection:
+                watch_count = connection.execute(
+                    "SELECT COUNT(*) FROM watched_symbols"
+                ).fetchone()[0]
+
+        self.assertEqual(watch_count, 0)
+
+    def test_duplicate_snapshot_write_returns_same_row_without_duplicate(self):
+        quote = {
+            "company": "Apple Inc.",
+            "ticker": "AAPL",
+            "currency": "USD",
+            "price": 230.0,
+            "observed_at": "2026-11-20T21:00:00+00:00",
+            "exchange_session_date": "2026-11-20",
+        }
+        with TemporaryDirectory() as directory:
+            database_path = stock_watcher.initialize_project(Path(directory))
+            first_id = stock_watcher.store_snapshot(quote, database_path)
+            second_id = stock_watcher.store_snapshot(quote, database_path)
+            with closing(sqlite3.connect(database_path)) as connection:
+                count = connection.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
+        self.assertEqual(first_id, second_id)
+        self.assertEqual(count, 1)
+
+    def test_same_session_check_makes_no_baseline_or_flag_change(self):
+        resolved = {"brand": "Apple", "ticker": "AAPL", "company": "Apple Inc."}
+        quote = {
+            "observations": [{"price": 230.0, "exchange_session_date": "2026-11-20"}],
+            "split_dates": [],
+        }
+        with TemporaryDirectory() as directory:
+            database_path = stock_watcher.initialize_project(Path(directory))
+            stock_watcher.add_watched_symbol(resolved, "AAPL", database_path)
+            with closing(sqlite3.connect(database_path)) as connection, connection:
+                connection.execute(
+                    "UPDATE watched_symbols SET baseline_price = 220.0, baseline_session_date = '2026-11-20' WHERE ticker = 'AAPL'"
+                )
+            with patch.object(stock_watcher, "fetch_stock_history", return_value=quote):
+                result = stock_watcher.check_watched_symbol(resolved, 3.0, database_path)
+            with closing(sqlite3.connect(database_path)) as connection:
+                baseline = connection.execute(
+                    "SELECT baseline_price, baseline_session_date FROM watched_symbols"
+                ).fetchone()
+        self.assertTrue(result["same_session"])
+        self.assertFalse(result["flag"])
+        self.assertEqual(baseline, (220.0, "2026-11-20"))
 
 
 if __name__ == "__main__":

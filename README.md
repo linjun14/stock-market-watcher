@@ -112,3 +112,30 @@ This skill package does not:
 - Send private search queries, financial histories, or tracking profiles to third-party services. Public-source requests should include only the information needed to retrieve the requested market data or news.
 - Scrape websites or make unauthorized writes to external services. Prefer public market-data sources and use only access methods permitted by the source.
 - Bypass paywalls, rate limits, authentication, or other access controls on restricted financial services.
+
+### Summarize versus watch
+
+Use `summarize` for a requested historical summary or stock-performance question:
+
+```bash
+python3 scripts/stock_watcher.py summarize --brand "Apple" --months 1
+```
+
+Summaries fetch and save daily close snapshots, store matching news, and generate a Markdown report. They do not add the symbol to the watch registry. The existing `price` command remains a backward-compatible summarize alias.
+
+Use `watch` only for an explicit request to track or monitor a brand. Resolve the symbol through Yahoo Finance, ask the user to confirm the resolved ticker, and then add it:
+
+```bash
+python3 scripts/stock_watcher.py watch --brand "Apple" --confirmed-ticker "AAPL"
+```
+
+Watch mode validates that the confirmation exactly matches Yahoo Finance’s resolved ticker. It writes only to `watched_symbols`; it does not fetch chart history, create snapshots, retrieve news, or write a report.
+
+### Check a watchlist baseline
+
+```bash
+python3 scripts/stock_watcher.py watch-check --brand "Apple"
+python3 scripts/stock_watcher.py watch-check --brand "Apple" --threshold-percent 5
+```
+
+A newly watched symbol has no baseline until its first successful check. That check saves the latest completed regular-session close and exchange date without triggering an alert. Later checks compare against that baseline, using a strict threshold: exactly `+3%` or `-3%` does not flag, while values beyond those limits do. On a new comparable session, the baseline is updated to the latest close and session date.

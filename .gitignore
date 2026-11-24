@@ -3,3 +3,5 @@ reports/
 tests/
 test_stock_watcher.py
 .gitignore
+__pycache__/
+scripts/__pycache__/
