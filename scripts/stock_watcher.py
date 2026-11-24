@@ -6,6 +6,7 @@ import calendar
 from contextlib import closing
 from datetime import date, datetime, time, timedelta, timezone
 import json
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -178,8 +179,13 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     ):
         command_parser = commands.add_parser(command_name, help=help_text)
-        command_parser.add_argument("--brand", required=True,
-                                    help="company or brand name (or stock ticker)")
+        brand_options = {"action": "append"} if command_name == "summarize" else {}
+        command_parser.add_argument(
+            "--brand",
+            required=True,
+            help="company or brand name (or stock ticker)",
+            **brand_options,
+        )
         command_parser.add_argument("--months", type=positive_integer, default=1,
                                     help="number of calendar months to track (default: 1)")
         command_parser.add_argument("--fromdate", type=parse_date,
@@ -200,6 +206,7 @@ def build_parser() -> argparse.ArgumentParser:
     price_parser.add_argument(
         "--brand",
         required=True,
+        action="append",
         help="company or brand name (or stock ticker)",
     )
     price_parser.add_argument(
@@ -219,7 +226,7 @@ def build_parser() -> argparse.ArgumentParser:
         "watch-check",
         help="check a watched brand against its stored baseline",
     )
-    check_parser.add_argument("--brand", required=True,
+    check_parser.add_argument("--brand", required=True, action="append",
                               help="watched company or brand name (or ticker)")
     check_parser.add_argument("--threshold-percent", type=percentage,
                               default=3.0,
@@ -745,6 +752,36 @@ def escape_markdown_text(value: str) -> str:
     return value.replace("\n", " ").replace("\r", " ")
 
 
+def write_error_report(report_dir: Path, brand: str, reason: str,
+                       ticker: str | None = None,
+                       baseline_unchanged: bool = False) -> Path:
+    """Write a dated warning report for a brand whose fetch did not complete."""
+    report_symbol = ticker or brand
+    filename_symbol = re.sub(r"[^A-Za-z0-9.-]+", "_", report_symbol).strip("_.-")
+    filename_symbol = filename_symbol.upper() or "UNKNOWN"
+    report_date = datetime.now(timezone.utc).strftime("%Y%m%d")
+    report_path = report_dir / f"{filename_symbol}_{report_date}_error.md"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    lines = [
+        f"# Stock check warning: {escape_markdown_text(brand)}",
+        "",
+        f"- Brand requested: {escape_markdown_text(brand)}",
+    ]
+    if ticker:
+        lines.append(f"- Resolved ticker: {escape_markdown_text(ticker)}")
+    lines.extend([
+        "- Status: This brand was not checked because the operation failed.",
+        (
+            "- Watch baseline: baseline_price and baseline_session_date were left untouched."
+            if baseline_unchanged
+            else "- Watch baseline: Not modified by this operation."
+        ),
+        f"- Reason: {escape_markdown_text(reason)}",
+    ])
+    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return report_path
+
+
 def format_quote(quote: dict) -> str:
     """Format the period summary, skipping comparisons across splits."""
     precision = quote["price_hint"]
@@ -1044,6 +1081,50 @@ def check_watched_symbol(resolved: dict, threshold_percent: float, database_path
     }
 
 
+def summarize_brand(brand: str, start_date: date, end_date: date,
+                    database_path: Path) -> None:
+    """Fetch, save, and report one brand without coupling it to other brands."""
+    quote = fetch_stock_history(brand, start_date, end_date)
+    snapshot_ids = {}
+    for observation in quote["observations"]:
+        snapshot_ids[observation["observed_at"]] = store_snapshot(
+            {**quote, **observation}, database_path
+        )
+    moves = significant_moves(quote)
+    news_by_move = {}
+    news_errors = {}
+    for move in moves:
+        move_date = date.fromisoformat(observation_session_date(move["current"]))
+        move_date_text = move_date.isoformat()
+        try:
+            articles = fetch_related_news(quote["ticker"], move_date, quote["company"])
+        except RuntimeError as error:
+            news_errors[move_date_text] = str(error)
+            print(
+                f"Warning: related news lookup failed for {quote['ticker']} "
+                f"on {move_date_text}: {error}",
+                file=sys.stderr,
+            )
+            continue
+        news_by_move[move_date_text] = articles
+        snapshot_id = snapshot_ids[move["current"]["observed_at"]]
+        for article in articles:
+            store_news_item(article, snapshot_id, database_path)
+    report_path = write_report(
+        quote,
+        PROJECT_ROOT / REPORTS_DIR_NAME,
+        start_date,
+        end_date,
+        moves,
+        news_by_move,
+        news_errors,
+    )
+    print(format_quote(quote))
+    for line in format_move_news(quote, moves, news_by_move, news_errors):
+        print(line)
+    print(f"Report: {report_path.relative_to(PROJECT_ROOT)}")
+
+
 def main() -> int:
     """Parse the requested command and execute its action."""
     args = build_parser().parse_args()
@@ -1060,55 +1141,38 @@ def main() -> int:
         try:
             database_path = initialize_project()
             start_date, end_date = get_date_range(args.months, args.fromdate)
-            quote = fetch_stock_history(args.brand, start_date, end_date)
-            snapshot_ids = {}
-            for observation in quote["observations"]:
-                snapshot_ids[observation["observed_at"]] = store_snapshot(
-                    {**quote, **observation}, database_path
-                )
-            moves = significant_moves(quote)
-            news_by_move = {}
-            news_errors = {}
-            for move in moves:
-                move_date = date.fromisoformat(
-                    observation_session_date(move["current"])
-                )
-                move_date_text = move_date.isoformat()
-                try:
-                    articles = fetch_related_news(
-                        quote["ticker"], move_date, quote["company"]
-                    )
-                except RuntimeError as error:
-                    news_errors[move_date_text] = str(error)
-                    print(
-                        f"Warning: related news lookup failed for "
-                        f"{move_date_text}: {error}",
-                        file=sys.stderr,
-                    )
-                    continue
-                news_by_move[move_date_text] = articles
-                snapshot_id = snapshot_ids[move["current"]["observed_at"]]
-                for article in articles:
-                    store_news_item(article, snapshot_id, database_path)
-            report_path = write_report(
-                quote,
-                PROJECT_ROOT / REPORTS_DIR_NAME,
-                start_date,
-                end_date,
-                moves,
-                news_by_move,
-                news_errors,
-            )
-            print(f"{format_quote(quote)}")
-            for line in format_move_news(
-                quote, moves, news_by_move, news_errors
-            ):
-                print(line)
-            print(f"Report: {report_path.relative_to(PROJECT_ROOT)}")
         except (RuntimeError, ValueError, OSError, sqlite3.Error) as error:
             print(f"Error: {error}", file=sys.stderr)
             return 1
-        return 0
+        had_errors = False
+        for brand in args.brand:
+            try:
+                summarize_brand(brand, start_date, end_date, database_path)
+            except (RuntimeError, ValueError, OSError, sqlite3.Error) as error:
+                had_errors = True
+                failed_ticker = None
+                try:
+                    failed_ticker = resolve_equity(brand)["ticker"]
+                except (RuntimeError, ValueError, OSError, sqlite3.Error):
+                    pass
+                try:
+                    error_report = write_error_report(
+                        PROJECT_ROOT / REPORTS_DIR_NAME,
+                        brand,
+                        str(error),
+                        failed_ticker,
+                    )
+                    report_note = (
+                        f" Error report: {error_report.relative_to(PROJECT_ROOT)}"
+                    )
+                except (OSError, ValueError) as report_error:
+                    report_note = f" Could not write error report: {report_error}"
+                print(
+                    f"Warning: {brand} was not checked because its fetch failed: "
+                    f"{error}.{report_note}",
+                    file=sys.stderr,
+                )
+        return 1 if had_errors else 0
 
     if args.command == "watch":
         try:
@@ -1129,10 +1193,42 @@ def main() -> int:
     if args.command == "watch-check":
         try:
             database_path = initialize_project()
-            resolved = resolve_equity(args.brand)
-            result = check_watched_symbol(
-                resolved, args.threshold_percent, database_path
-            )
+        except (RuntimeError, ValueError, OSError, sqlite3.Error) as error:
+            print(f"Error: {error}", file=sys.stderr)
+            return 1
+
+        had_errors = False
+        for brand in args.brand:
+            resolved = None
+            try:
+                resolved = resolve_equity(brand)
+                result = check_watched_symbol(
+                    resolved, args.threshold_percent, database_path
+                )
+            except (RuntimeError, ValueError, OSError, sqlite3.Error) as error:
+                had_errors = True
+                ticker = resolved["ticker"] if resolved else None
+                try:
+                    error_report = write_error_report(
+                        PROJECT_ROOT / REPORTS_DIR_NAME,
+                        brand,
+                        str(error),
+                        ticker,
+                        baseline_unchanged=True,
+                    )
+                    report_note = (
+                        f" Error report: {error_report.relative_to(PROJECT_ROOT)}"
+                    )
+                except (OSError, ValueError) as report_error:
+                    report_note = f" Could not write error report: {report_error}"
+                symbol = f" ({ticker})" if ticker else ""
+                print(
+                    f"Warning: {brand}{symbol} was not checked: {error}. "
+                    f"Its baseline fields were left untouched.{report_note}",
+                    file=sys.stderr,
+                )
+                continue
+
             if result["baseline_established"]:
                 print(
                     f"Baseline established for {resolved['ticker']} at "
@@ -1158,10 +1254,7 @@ def main() -> int:
                     f"session: {result['new_session_date']}; "
                     f"flag: {'yes' if result['flag'] else 'no'}"
                 )
-            return 0
-        except (RuntimeError, ValueError, OSError, sqlite3.Error) as error:
-            print(f"Error: {error}", file=sys.stderr)
-            return 1
+        return 1 if had_errors else 0
 
     return 2
 

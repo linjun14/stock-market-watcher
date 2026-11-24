@@ -119,7 +119,10 @@ Use `summarize` for a requested historical summary or stock-performance question
 
 ```bash
 python3 scripts/stock_watcher.py summarize --brand "Apple" --months 1
+python3 scripts/stock_watcher.py summarize --brand "Apple" --brand "Microsoft"
 ```
+
+Pass `--brand` once per company to summarize multiple brands in one invocation. A failed symbol gets its own `reports/[ticker]_[YYYYMMDD]_error.md` warning report; successful symbols are still fetched and reported.
 
 Summaries fetch and save daily close snapshots, store matching news, and generate a Markdown report. They do not add the symbol to the watch registry. The existing `price` command remains a backward-compatible summarize alias.
 
@@ -136,6 +139,7 @@ Watch mode validates that the confirmation exactly matches Yahoo Finance’s res
 ```bash
 python3 scripts/stock_watcher.py watch-check --brand "Apple"
 python3 scripts/stock_watcher.py watch-check --brand "Apple" --threshold-percent 5
+python3 scripts/stock_watcher.py watch-check --brand "Apple" --brand "MSFT"
 ```
 
-A newly watched symbol has no baseline until its first successful check. That check saves the latest completed regular-session close and exchange date without triggering an alert. Later checks compare against that baseline, using a strict threshold: exactly `+3%` or `-3%` does not flag, while values beyond those limits do. On a new comparable session, the baseline is updated to the latest close and session date.
+A newly watched symbol has no baseline until its first successful check. That check saves the latest completed regular-session close and exchange date without triggering an alert. Later checks compare against that baseline, using a strict threshold: exactly `+3%` or `-3%` does not flag, while values beyond those limits do. On a new comparable session, the baseline is updated to the latest close and session date. Pass `--brand` once per symbol to check multiple brands in one run. Each brand is handled independently: a failed fetch is reported without changing that symbol's `baseline_price` or `baseline_session_date`, and the remaining brands are still checked. Each failure produces a separate `reports/[ticker]_[YYYYMMDD]_error.md` report with the reason and an explicit not-checked warning.

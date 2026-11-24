@@ -61,6 +61,8 @@ Run this directly with:
 python3 scripts/stock_watcher.py summarize --brand "Apple" --months 1
 ```
 
+For multiple companies, pass `--brand` once per company in the same invocation. If one price fetch fails, record its reason in a separate dated error report and continue fetching the remaining companies.
+
 The legacy `price` command remains available as an alias for `summarize`; it also does not modify the watch registry.
 
 ### Watch or track a brand
@@ -81,10 +83,13 @@ Summaries and snapshot fetches must never imply that a stock is being watched. C
 ### Watchlist checks
 
 Use `watch-check --brand "Apple"` to check an active watched symbol. The default threshold is 3%; pass `--threshold-percent` to override it.
+For a request covering multiple brands, pass `--brand` once per brand in a single invocation (for example, `watch-check --brand "Apple" --brand "MSFT"`). Process every brand independently so one failed fetch does not prevent the others from being checked.
 
 - A watched symbol begins with `baseline_price` and `baseline_session_date` set to NULL.
 - The first successful check saves the latest completed regular-session close and its exchange date as the baseline. It never triggers an alert.
 - If the first fetch fails, both baseline fields remain NULL so the next check may establish them.
+- If a later fetch fails, leave that symbol's existing `baseline_price` and `baseline_session_date` untouched, report that it was not checked, and continue checking the other requested symbols.
+- Write one error report per failed brand under `reports/`, named `[ticker]_[YYYYMMDD]_error.md` (use a sanitized brand name if ticker resolution itself failed). Include the brand/ticker, failure reason, and a warning that it was not checked.
 - For later checks, calculate signed net change and percentage change from the baseline.
 - Trigger a flag only when the percentage is strictly greater than `+threshold` or strictly less than `-threshold`; exactly matching the threshold does not flag.
 - Update the baseline only when the latest session date differs from `baseline_session_date` and the prices are comparable.
@@ -105,6 +110,7 @@ Each `snapshots` row represents one price observation. `exchange_session_date` i
 
 - SQLite database: `.state/stock_market_watcher.db` for timestamped stock observations and watch registrations. Create `.state/` if it does not exist.
 - Markdown report: a generated report file in `reports/`, named `[ticker-name]_[current date in YYYYMMDD].md` (for example, `AAPL_20261122.md`). Create `reports/` if it does not exist.
+- Partial-failure report: `reports/[ticker]_[YYYYMMDD]_error.md`, with the failure reason and not-checked warning.
 - These are runtime output files and must not be tracked or committed in git.
 
 ## Guardrails & Error Handling
