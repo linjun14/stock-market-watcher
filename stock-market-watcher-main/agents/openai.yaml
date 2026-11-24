@@ -1,0 +1,4 @@
+interface:
+  display_name: "Stock Market Watcher"
+  short_description: "Summarize or explicitly watch a named company's stock"
+  default_prompt: "For [company or ticker], distinguish whether the user wants a historical stock summary or explicitly wants to watch/track the brand. For summaries, resolve Yahoo Finance, save timestamped closing-price snapshots, and write a report without adding a watch entry. For watch requests, resolve Yahoo Finance, ask the user to confirm the exact ticker, and add only the confirmed symbol to the watch registry without fetching or saving price history."
