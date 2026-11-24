@@ -10,7 +10,6 @@ import re
 import sqlite3
 import sys
 from pathlib import Path
-from statistics import fmean, pstdev
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
@@ -158,6 +157,30 @@ def initialize_project(project_root: Path | None = None) -> Path:
     return database_path
 
 
+def add_price_arguments(parser: argparse.ArgumentParser,
+                        multiple_brands: bool = False) -> None:
+    """Add the shared brand and date-range options for price summaries."""
+    brand_options = {"action": "append"} if multiple_brands else {}
+    parser.add_argument(
+        "--brand",
+        required=True,
+        help="company or brand name (or stock ticker)",
+        **brand_options,
+    )
+    parser.add_argument(
+        "--months",
+        type=positive_integer,
+        default=1,
+        help="number of calendar months to track (default: 1)",
+    )
+    parser.add_argument(
+        "--fromdate",
+        type=parse_date,
+        default=datetime.now(timezone.utc).date(),
+        help="end date in YYYY-MM-DD format (default: today)",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Define the command-line arguments accepted by this script."""
     parser = argparse.ArgumentParser(
@@ -168,59 +191,33 @@ def build_parser() -> argparse.ArgumentParser:
         "init",
         help="initialize the .state and reports directories",
     )
-    for command_name, help_text in (
-        (
-            "summarize",
-            "fetch and report historical prices without changing the watch list",
-        ),
-        (
-            "watch",
-            "resolve and confirm a symbol, then add it to the watch registry",
-        ),
-    ):
-        command_parser = commands.add_parser(command_name, help=help_text)
-        brand_options = {"action": "append"} if command_name == "summarize" else {}
-        command_parser.add_argument(
-            "--brand",
-            required=True,
-            help="company or brand name (or stock ticker)",
-            **brand_options,
-        )
-        command_parser.add_argument("--months", type=positive_integer, default=1,
-                                    help="number of calendar months to track (default: 1)")
-        command_parser.add_argument("--fromdate", type=parse_date,
-                                    default=datetime.now(timezone.utc).date(),
-                                    help="end date in YYYY-MM-DD format (default: today)")
-        if command_name == "watch":
-            command_parser.add_argument(
-                "--confirmed-ticker",
-                required=True,
-                help="ticker explicitly confirmed against Yahoo Finance",
-            )
+    summarize_parser = commands.add_parser(
+        "summarize",
+        help="fetch and report historical prices without changing the watch list",
+    )
+    add_price_arguments(summarize_parser, multiple_brands=True)
+
+    watch_parser = commands.add_parser(
+        "watch",
+        help="resolve and confirm a symbol, then add it to the watch registry",
+    )
+    watch_parser.add_argument(
+        "--brand",
+        required=True,
+        help="company or brand name (or stock ticker)",
+    )
+    watch_parser.add_argument(
+        "--confirmed-ticker",
+        required=True,
+        help="ticker explicitly confirmed against Yahoo Finance",
+    )
 
     # Backward-compatible alias: price performs summary only and never watches.
     price_parser = commands.add_parser(
         "price",
         help="fetch the latest available stock price for a brand or company",
     )
-    price_parser.add_argument(
-        "--brand",
-        required=True,
-        action="append",
-        help="company or brand name (or stock ticker)",
-    )
-    price_parser.add_argument(
-        "--months",
-        type=positive_integer,
-        default=1,
-        help="number of calendar months to track (default: 1)",
-    )
-    price_parser.add_argument(
-        "--fromdate",
-        type=parse_date,
-        default=datetime.now(timezone.utc).date(),
-        help="end date in YYYY-MM-DD format (default: today)",
-    )
+    add_price_arguments(price_parser, multiple_brands=True)
 
     check_parser = commands.add_parser(
         "watch-check",
@@ -302,9 +299,10 @@ def fetch_json(url: str) -> dict:
         raise RuntimeError("The market data service returned invalid JSON.") from error
 
 
-def fetch_stock_history(brand: str, start_date: date, end_date: date) -> dict:
-    """Resolve a brand and return daily closes within the requested date range."""
-    resolved = resolve_equity(brand)
+def fetch_stock_history(brand: str, start_date: date, end_date: date,
+                        resolved: dict | None = None) -> dict:
+    """Fetch daily closes, resolving the brand unless a match is supplied."""
+    resolved = resolved or resolve_equity(brand)
     ticker = resolved["ticker"]
     period1 = int(datetime.combine(start_date, time.min, timezone.utc).timestamp())
     period2 = int(
@@ -995,6 +993,7 @@ def check_watched_symbol(resolved: dict, threshold_percent: float, database_path
         ticker,
         date.today() - timedelta(days=31),
         date.today(),
+        resolved=resolved,
     )
     observations = sorted(quote["observations"], key=observation_session_date)
     latest = observations[-1]
@@ -1082,9 +1081,9 @@ def check_watched_symbol(resolved: dict, threshold_percent: float, database_path
 
 
 def summarize_brand(brand: str, start_date: date, end_date: date,
-                    database_path: Path) -> None:
+                    database_path: Path, resolved: dict) -> None:
     """Fetch, save, and report one brand without coupling it to other brands."""
-    quote = fetch_stock_history(brand, start_date, end_date)
+    quote = fetch_stock_history(brand, start_date, end_date, resolved=resolved)
     snapshot_ids = {}
     for observation in quote["observations"]:
         snapshot_ids[observation["observed_at"]] = store_snapshot(
@@ -1146,15 +1145,15 @@ def main() -> int:
             return 1
         had_errors = False
         for brand in args.brand:
+            resolved = None
             try:
-                summarize_brand(brand, start_date, end_date, database_path)
+                resolved = resolve_equity(brand)
+                summarize_brand(
+                    brand, start_date, end_date, database_path, resolved
+                )
             except (RuntimeError, ValueError, OSError, sqlite3.Error) as error:
                 had_errors = True
-                failed_ticker = None
-                try:
-                    failed_ticker = resolve_equity(brand)["ticker"]
-                except (RuntimeError, ValueError, OSError, sqlite3.Error):
-                    pass
+                failed_ticker = resolved["ticker"] if resolved else None
                 try:
                     error_report = write_error_report(
                         PROJECT_ROOT / REPORTS_DIR_NAME,
