@@ -1,0 +1,4 @@
+interface:
+  display_name: "Stock Market Watcher"
+  short_description: "Look up or track a named company's stock"
+  default_prompt: "For [company or ticker], retrieve its available public stock price and requested market context, save a timestamped snapshot, and summarize the result with sources. If the company or ticker is ambiguous, ask for clarification."

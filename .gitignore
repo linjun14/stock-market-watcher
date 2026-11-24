@@ -1,0 +1,5 @@
+.state/
+reports/
+tests/
+test_stock_watcher.py
+.gitignore
