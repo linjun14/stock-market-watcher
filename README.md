@@ -143,3 +143,114 @@ python3 scripts/stock_watcher.py watch-check --brand "Apple" --brand "MSFT"
 ```
 
 A newly watched symbol has no baseline until its first successful check. That check saves the latest completed regular-session close and exchange date without triggering an alert. Later checks compare against that baseline, using a strict threshold: exactly `+3%` or `-3%` does not flag, while values beyond those limits do. On a new comparable session, the baseline is updated to the latest close and session date. Pass `--brand` once per symbol to check multiple brands in one run. Each brand is handled independently: a failed fetch is reported without changing that symbol's `baseline_price` or `baseline_session_date`, and the remaining brands are still checked. Each failure produces a separate `reports/[ticker]_[YYYYMMDD]_error.md` report with the reason and an explicit not-checked warning.
+
+### Offline fixture walkthrough
+
+`--fixture` is an optional deterministic mode. It does not replace Yahoo Finance in normal runs; it only bypasses Yahoo for local testing and documentation. The sample fixture is at [`fixtures/watchlist_cases.json`](fixtures/watchlist_cases.json).
+
+It contains Apple (`AAPL`), Microsoft (`MSFT`), a repeated-session symbol (`REPEAT`), an unavailable symbol (`UNAVAILABLE`), and a trend-report symbol (`TREND`). The fixture can demonstrate:
+
+- a `100.00 → 104.00` move at the default 3% threshold;
+- a `100.00 → 103.00` exact boundary;
+- a repeated session with no duplicate snapshot or baseline change;
+- a partial batch where an unavailable symbol preserves its baseline while a successful symbol proceeds;
+- a local trend report with no network/news dependency.
+
+Before the watchlist commands, initialize a test database and seed the watchlist baselines. The SQLite database is local runtime state; use a disposable database by setting `PYTHON...` only in a test harness, or manually execute the setup below in `.state/stock_market_watcher.db`.
+
+#### Setup / State
+
+```sql
+INSERT INTO companies (name, ticker, created_at)
+VALUES ('Apple Inc.', 'AAPL', '2024-01-12T20:00:00+00:00');
+INSERT INTO watched_symbols
+(company_id, ticker, added_at, active, baseline_price, baseline_session_date)
+VALUES (
+  (SELECT company_id FROM companies WHERE ticker = 'AAPL'),
+  'AAPL', '2024-01-12T20:00:00+00:00', 1, 100.00, '2024-01-10'
+);
+
+INSERT INTO companies (name, ticker, created_at)
+VALUES ('Microsoft Corporation', 'MSFT', '2024-01-12T20:00:00+00:00');
+INSERT INTO watched_symbols
+(company_id, ticker, added_at, active, baseline_price, baseline_session_date)
+VALUES (
+  (SELECT company_id FROM companies WHERE ticker = 'MSFT'),
+  'MSFT', '2024-01-12T20:00:00+00:00', 1, 100.00, '2024-01-11'
+);
+
+INSERT INTO companies (name, ticker, created_at)
+VALUES ('Repeated Session Example', 'REPEAT', '2024-01-12T20:00:00+00:00');
+INSERT INTO watched_symbols
+(company_id, ticker, added_at, active, baseline_price, baseline_session_date)
+VALUES (
+  (SELECT company_id FROM companies WHERE ticker = 'REPEAT'),
+  'REPEAT', '2024-01-12T20:00:00+00:00', 1, 103.00, '2024-01-12'
+);
+
+INSERT INTO companies (name, ticker, created_at)
+VALUES ('Unavailable Example Inc.', 'UNAVAILABLE', '2024-01-12T20:00:00+00:00');
+INSERT INTO watched_symbols
+(company_id, ticker, added_at, active, baseline_price, baseline_session_date)
+VALUES (
+  (SELECT company_id FROM companies WHERE ticker = 'UNAVAILABLE'),
+  'UNAVAILABLE', '2024-01-12T20:00:00+00:00', 1, 100.00, '2024-01-10'
+);
+```
+
+The fixture setup and expected results are:
+
+| Case | Baseline | Fixture close/session | Command condition | Expected result |
+|---|---:|---:|---|---|
+| Flagged move | `100.00` / `2024-01-10` | `104.00` / `2024-01-12` | `AAPL`, default threshold 3% | Alert `yes`, signed `+4.00%`, baseline becomes `104.00` / `2024-01-12` |
+| Exact boundary | `100.00` / `2024-01-11` | `103.00` / `2024-01-12` | `MSFT`, default threshold 3% | Alert `no`, signed `+3.00%`, baseline becomes `103.00` / `2024-01-12` |
+| Repeated session | `103.00` / `2024-01-12` | `103.00` / `2024-01-12` | `REPEAT` | No alert, baseline remains `103.00` / `2024-01-12`, no duplicate snapshot |
+| Partial failure | `100.00` / `2024-01-10` | unavailable | `UNAVAILABLE` + `AAPL` | UNAVAILABLE is warned/reported, its baseline is preserved, AAPL still proceeds |
+
+#### Commands and Expected Outcomes
+
+Flagged move:
+
+```bash
+python scripts/stock_watcher.py watch-check --brand "AAPL" --fixture fixtures/watchlist_cases.json
+```
+
+Expected: `AAPL net change: +4.00; percent change: +4.00%; threshold: 3.00%; session: 2024-01-12; flag: yes`.
+
+Exact threshold boundary:
+
+```bash
+python scripts/stock_watcher.py watch-check --brand "MSFT" --fixture fixtures/watchlist_cases.json
+```
+
+Expected: `MSFT net change: +3.00; percent change: +3.00%; threshold: 3.00%; session: 2024-01-12; flag: no`. The baseline is updated because the session is new.
+
+Repeated weekend/session check:
+
+```bash
+python scripts/stock_watcher.py watch-check --brand "REPEAT" --fixture fixtures/watchlist_cases.json
+```
+
+Expected: `No changes for REPEAT: session 2024-01-12 matches the baseline session`. It prints no signed movement and does not update the baseline or create duplicate snapshot state.
+
+Partial batch failure:
+
+```bash
+python scripts/stock_watcher.py watch-check --brand "UNAVAILABLE" --brand "AAPL" --fixture fixtures/watchlist_cases.json
+```
+
+Expected: `UNAVAILABLE` prints a warning and writes `reports/UNAVAILABLE_YYYYMMDD_error.md`; it preserves `baseline_price = 100.00` and `baseline_session_date = 2024-01-10`. `AAPL` still prints `flag: yes` and updates to `104.00` / `2024-01-12`. The command returns exit status `1` because at least one brand failed.
+
+Offline trend report:
+
+```bash
+python scripts/stock_watcher.py summarize --brand "TREND" --fixture fixtures/watchlist_cases.json
+```
+
+Expected: no Yahoo request; a dated `TREND_YYYYMMDD.md` report is written, with the available close series and its trend metrics. Fixture mode also works with `price` and `watch-check`.
+
+Verify watchlist state with SQLite:
+
+```bash
+python -c "import sqlite3; c=sqlite3.connect('.state/stock_market_watcher.db'); print(*c.execute('SELECT ticker, baseline_price, baseline_session_date FROM watched_symbols ORDER BY ticker'), sep='\\n')"
+```

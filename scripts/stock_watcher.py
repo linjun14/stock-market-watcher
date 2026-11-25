@@ -179,6 +179,11 @@ def add_price_arguments(parser: argparse.ArgumentParser,
         default=datetime.now(timezone.utc).date(),
         help="end date in YYYY-MM-DD format (default: today)",
     )
+    parser.add_argument(
+        "--fixture",
+        default=None,
+        help="load local offline fixture JSON instead of Yahoo Finance",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -211,6 +216,11 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="ticker explicitly confirmed against Yahoo Finance",
     )
+    watch_parser.add_argument(
+        "--fixture",
+        default=None,
+        help="load local offline fixture JSON instead of Yahoo Finance",
+    )
 
     # Backward-compatible alias: price performs summary only and never watches.
     price_parser = commands.add_parser(
@@ -228,6 +238,11 @@ def build_parser() -> argparse.ArgumentParser:
     check_parser.add_argument("--threshold-percent", type=percentage,
                               default=3.0,
                               help="strict absolute percentage threshold (default: 3.0)")
+    check_parser.add_argument(
+        "--fixture",
+        default=None,
+        help="load local offline fixture JSON instead of Yahoo Finance",
+    )
     return parser
 
 
@@ -301,9 +316,19 @@ def fetch_json(url: str) -> dict:
 
 def fetch_stock_history(brand: str, start_date: date, end_date: date,
                         resolved: dict | None = None) -> dict:
-    """Fetch daily closes, resolving the brand unless a match is supplied."""
+    """Fetch daily closes from a fixture or Yahoo Finance."""
     resolved = resolved or resolve_equity(brand)
     ticker = resolved["ticker"]
+
+    if FIXTURE_DATA is not None:
+        entry = fixture_symbol(ticker)
+        if not entry:
+            raise ValueError(f"No fixture symbol was found for {ticker}.")
+        quote = fixture_quote(entry, brand)
+        if not quote["observations"]:
+            raise ValueError(f"No historical closing prices are available for {ticker}.")
+        return quote
+
     period1 = int(datetime.combine(start_date, time.min, timezone.utc).timestamp())
     period2 = int(
         datetime.combine(end_date + timedelta(days=1), time.min, timezone.utc).timestamp()
@@ -520,7 +545,10 @@ def normalize_news_item(item: dict) -> dict | None:
 def fetch_related_news(
     ticker: str, move_date: date, company: str | None = None
 ) -> list[dict]:
-    """Search Yahoo Finance news near a move, with a closest-result fallback."""
+    """Search Yahoo Finance news, or return no news in offline fixture mode."""
+    if FIXTURE_DATA is not None:
+        return []
+
     search_url = "https://query1.finance.yahoo.com/v1/finance/search?"
     candidates = []
     seen_urls = set()
@@ -791,13 +819,14 @@ def format_quote(quote: dict) -> str:
     basis = quote.get("price_basis", "unadjusted")
     start_text = observation_session_date(first)
     end_text = observation_session_date(last)
+    source = quote.get("source", "Yahoo Finance")
     if not comparison_is_valid(quote, first, last):
         split_text = ", ".join(quote.get("split_dates", [])) or "a stock split"
         return (
             f"{quote['company']} ({quote['ticker']}): price comparison skipped "
             f"because the unadjusted series spans {split_text}; "
             f"period {start_text} to {end_text}; {len(observations)} daily closes "
-            f"(price basis: {basis}; source: Yahoo Finance)"
+            f"(price basis: {basis}; source: {source})"
         )
     net_change = last["price"] - first["price"]
     percent_change = net_change / first["price"] * 100 if first["price"] else 0
@@ -805,7 +834,7 @@ def format_quote(quote: dict) -> str:
         f"{quote['company']} ({quote['ticker']}): net change "
         f"{net_change:+,.{precision}f} {quote['currency']} ({percent_change:+.2f}%) "
         f"from {start_text} to {end_text}; {len(observations)} daily closing prices "
-        f"(price basis: {basis}; source: Yahoo Finance)"
+        f"(price basis: {basis}; source: {source})"
     )
 
 
@@ -869,6 +898,7 @@ def write_report(quote, report_dir, requested_start, requested_end,
     net_change = last["price"] - first["price"] if comparable else None
     percent_change = net_change / first["price"] * 100 if comparable and net_change is not None and first["price"] else None
     split_dates = ", ".join(quote.get("split_dates", []))
+    source = quote.get("source", "Yahoo Finance")
 
     lines = [
         f"# {quote['company']} ({quote['ticker']}) stock performance",
@@ -877,7 +907,7 @@ def write_report(quote, report_dir, requested_start, requested_end,
         f"- Available data: {observation_session_date(first)} to {observation_session_date(last)}",
         f"- Price basis: {basis}",
         "- Price basis note: unadjusted means Yahoo Finance raw closes; split-adjusted means historical closes are aligned for splits.",
-        "- Source: Yahoo Finance historical daily closing prices",
+        "- Source: " + (source + " historical daily closing prices" if source != "Yahoo Finance" else "Yahoo Finance historical daily closing prices"),
         "",
         "## Summary Metrics",
         "",
@@ -948,7 +978,18 @@ def write_report(quote, report_dir, requested_start, requested_end,
 
 
 def resolve_equity(brand: str) -> dict:
-    """Resolve a brand or ticker to one confirmed Yahoo Finance equity."""
+    """Resolve a brand or ticker through a fixture or Yahoo Finance."""
+    if FIXTURE_DATA is not None:
+        entry = fixture_symbol(brand)
+        if not entry:
+            raise ValueError(f"No fixture symbol was found for {brand!r}.")
+        ticker = str(entry.get("ticker") or brand).upper()
+        return {
+            "brand": brand,
+            "ticker": ticker,
+            "company": entry.get("company") or entry.get("brand") or brand,
+        }
+
     search_url = "https://query1.finance.yahoo.com/v1/finance/search?" + urlencode(
         {"q": brand, "quotesCount": 10, "newsCount": 0}
     )
@@ -1124,9 +1165,92 @@ def summarize_brand(brand: str, start_date: date, end_date: date,
     print(f"Report: {report_path.relative_to(PROJECT_ROOT)}")
 
 
+FIXTURE_DATA = None
+
+
+def load_fixture(path: str | None) -> dict | None:
+    """Load and validate a local offline fixture; live Yahoo access remains the default."""
+    if not path:
+        return None
+    fixture_path = Path(path)
+    if not fixture_path.is_file():
+        raise ValueError(f"Fixture file was not found: {fixture_path}")
+    try:
+        fixture_text = fixture_path.read_text(encoding="utf-8")
+        fixture = json.loads(fixture_text)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"Fixture file contains invalid JSON: {fixture_path}") from error
+    except OSError as error:
+        raise OSError(f"Could not read fixture file: {fixture_path}: {error}") from error
+    if not isinstance(fixture, dict) or not isinstance(fixture.get("symbols"), dict):
+        raise ValueError("Fixture must contain a 'symbols' JSON object.")
+    return fixture
+
+
+def fixture_symbol(brand: str) -> dict:
+    """Find a fixture entry by ticker or configured brand name."""
+    if FIXTURE_DATA is None:
+        return {}
+    needle = brand.strip().upper()
+    for symbol_key, entry in FIXTURE_DATA["symbols"].items():
+        if not isinstance(entry, dict):
+            continue
+        configured_ticker = str(entry.get("ticker") or symbol_key).upper()
+        configured_brand = str(entry.get("brand") or "").upper()
+        if needle in {symbol_key.upper(), configured_ticker, configured_brand}:
+            return entry
+    return {}
+
+
+def fixture_quote(entry: dict, brand: str) -> dict:
+    """Convert a fixture symbol entry to the normal resolved quote shape."""
+    if entry.get("error"):
+        raise ValueError(str(entry["error"]))
+    observations = entry.get("observations")
+    if not isinstance(observations, list) or not observations:
+        raise ValueError(f"Fixture has no observations for {entry.get('ticker') or brand}.")
+    normalized = []
+    for observation in observations:
+        if not isinstance(observation, dict):
+            raise ValueError("Fixture observations must be JSON objects.")
+        session_date = observation.get("session_date")
+        price = observation.get("price")
+        if not isinstance(session_date, str) or not isinstance(price, (int, float)):
+            raise ValueError("Fixture observations require session_date and numeric price.")
+        try:
+            date.fromisoformat(session_date)
+        except ValueError as error:
+            raise ValueError(f"Fixture has an invalid session_date: {session_date}") from error
+        normalized.append({
+            "price": float(price),
+            "observed_at": f"{session_date}T20:00:00+00:00",
+            "exchange_session_date": session_date,
+            "price_basis": "unadjusted",
+        })
+    ticker = str(entry.get("ticker") or brand).upper()
+    return {
+        "brand": brand,
+        "ticker": ticker,
+        "company": entry.get("company") or entry.get("brand") or brand,
+        "currency": entry.get("currency") or "USD",
+        "price_hint": 2,
+        "price_basis": "unadjusted",
+        "split_dates": entry.get("split_dates", []) if isinstance(entry.get("split_dates", []), list) else [],
+        "observations": normalized,
+        "source": "Local fixture",
+    }
+
+
 def main() -> int:
     """Parse the requested command and execute its action."""
     args = build_parser().parse_args()
+
+    global FIXTURE_DATA
+    try:
+        FIXTURE_DATA = load_fixture(getattr(args, "fixture", None))
+    except (ValueError, OSError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
 
     if args.command == "init":
         # Initialize the project and report the paths created or reused.

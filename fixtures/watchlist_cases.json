@@ -1,0 +1,57 @@
+{
+  "as_of": "2024-01-12",
+  "symbols": {
+    "AAPL": {
+      "brand": "Apple",
+      "company": "Apple Inc.",
+      "ticker": "AAPL",
+      "currency": "USD",
+      "split_dates": [],
+      "observations": [
+        {"session_date": "2024-01-10", "price": 100.00},
+        {"session_date": "2024-01-11", "price": 102.00},
+        {"session_date": "2024-01-12", "price": 104.00}
+      ]
+    },
+    "MSFT": {
+      "brand": "Microsoft",
+      "company": "Microsoft Corporation",
+      "ticker": "MSFT",
+      "currency": "USD",
+      "split_dates": [],
+      "observations": [
+        {"session_date": "2024-01-12", "price": 103.00}
+      ]
+    },
+    "REPEAT": {
+      "brand": "Repeated Session",
+      "company": "Repeated Session Example",
+      "ticker": "REPEAT",
+      "currency": "USD",
+      "split_dates": [],
+      "observations": [
+        {"session_date": "2024-01-12", "price": 103.00}
+      ]
+    },
+    "UNAVAILABLE": {
+      "brand": "Unavailable Example",
+      "company": "Unavailable Example Inc.",
+      "ticker": "UNAVAILABLE",
+      "error": "Fixture quote unavailable"
+    },
+    "TREND": {
+      "brand": "Trend Example",
+      "company": "Trend Example Inc.",
+      "ticker": "TREND",
+      "currency": "USD",
+      "split_dates": [],
+      "observations": [
+        {"session_date": "2024-01-08", "price": 100.00},
+        {"session_date": "2024-01-09", "price": 102.00},
+        {"session_date": "2024-01-10", "price": 101.00},
+        {"session_date": "2024-01-11", "price": 105.00},
+        {"session_date": "2024-01-12", "price": 104.00}
+      ]
+    }
+  }
+}
