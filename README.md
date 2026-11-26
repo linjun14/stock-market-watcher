@@ -58,13 +58,13 @@ Fetch Yahoo Finance daily closing prices for the last calendar month ending toda
 python3 scripts/stock_watcher.py price --brand "Microsoft"
 ```
 
-Each successful `price` command stores completed Yahoo Finance regular-session daily closes in `snapshots`, linked to the company and source. `exchange_session_date` records the exchange-local date of the close, while `captured_at` records when the script retrieved it; for a weekend run, Friday's session date is stored separately from Saturday's or Sunday's capture timestamp. The script omits an in-progress current-session bar. Previous observations are retained. This is a historical daily-close series only: the command does not combine it with a separate live quote or after-hours price feed. It prints the net price and percentage change between the first and last available closes, significant moves, and any related news headlines, source-provided summaries, publication timing, and cautious relevance context. It writes an initial Markdown report in `reports/` with date coverage, price metrics, every retrieved close, and available details for each related article. When run through the Codex skill, the report is then enriched with roughly two to three paragraphs of source-verified detail for each news item presented in the conversation; the standalone script only has access to source-provided article summaries. For each of the top three close-to-close moves, the script searches **Yahoo Finance only** for ticker-and-date news, then retries by ticker and company name if needed. It prefers articles published within three days of a move and otherwise reports the closest Yahoo Finance result. Yahoo Finance is the sole news-discovery source; its results may link to articles from other publishers, whose publisher attribution is retained. Returned articles and their source links are included in the report and stored in `news_items`. The report distinguishes possible context from proven causation and explicitly notes when no article is returned or news lookup fails. An internet connection is required. See [references/yahoo-finance-prices.md](references/yahoo-finance-prices.md) for price-source, retrieval, and coverage details, and [references/yahoo-finance-news.md](references/yahoo-finance-news.md) for news-source details.
+Each successful normal-mode `price` command stores completed Yahoo Finance regular-session daily closes in `snapshots`, including the exchange session date and capture time. This is historical close data only, not a live or after-hours quote.
+
+It prints net and percentage changes plus significant moves, searches Yahoo Finance for related move news, and writes a dated Markdown report under `reports/` with daily closes and available news details. Offline runs use `--fixture` instead; see [price-source details](references/yahoo-finance-prices.md) and [news-source details](references/yahoo-finance-news.md).
 
 ### Price data source, retrieval, and coverage
 
-Yahoo Finance is the sole source for the script's price series. The script resolves the requested name through Yahoo Finance's search JSON endpoint, then requests daily chart JSON for the returned equity ticker over the requested date range. It reads the ticker symbol, company name, currency and price precision metadata, chart timestamps, and daily `close` values. Those daily closes are the values stored and compared; the script does not use a separate live quote, adjusted close, or after-hours price series. See [references/yahoo-finance-prices.md](references/yahoo-finance-prices.md) for endpoint details and coverage limitations.
-
-The script does not restrict ticker results to a named exchange or independently verify listing venue. NYSE- and Nasdaq-listed equities are within the intended U.S. use case when Yahoo Finance returns usable symbols and chart history. Availability for Canadian and other international listings, OTC securities, and less-liquid tickers is not guaranteed; symbols may require Yahoo Finance's venue suffix, and price availability, currency metadata, or timing may vary. Confirm the resolved ticker and observation dates before relying on a result. Yahoo Finance data can be delayed and is not a real-time quote.
+Yahoo Finance is the sole source for the script's price series. The script resolves the requested name through Yahoo Finance's search JSON endpoint, then requests daily chart JSON for the returned equity ticker over the requested date range. It reads the ticker symbol, company name, currency and price precision metadata, chart timestamps, and daily `close` values. Those daily closes are the values stored and compared. See [references/yahoo-finance-prices.md](references/yahoo-finance-prices.md) for endpoint details and coverage limitations.
 
 Choose a different lookback in calendar months; `--fromdate` can also set the range's end date:
 
@@ -91,7 +91,7 @@ The general workflow is as follows:
 5. Calculate trend metrics such as net price change, percentage change, and daily volatility.
 6. Store the brand, ticker, source information, and point-in-time price observations in the local SQLite database. Append new observations to the existing history rather than replacing earlier snapshots.
 7. When previous snapshots are available or the request asks for a review, compare the latest prices and calculated changes with prior observations and rank the largest daily movements.
-8. For the top 2-3 close-to-close moves by absolute percentage change, search Yahoo Finance news around each date and associate matching articles with that day's snapshot. Yahoo Finance is the only news-discovery source; see [references/yahoo-finance-news.md](references/yahoo-finance-news.md).
+8. For the top 2-3 close-to-close moves by absolute percentage change, search Yahoo Finance news around each date and associate matching articles with that day's snapshot. Yahoo Finance is the only news-discovery source.
 9. Write a Markdown report with the sources, price trends, top daily moves, related news (or an explicit unavailable/no-match note), and comparison findings.
 
 ## What the package actually does
@@ -142,7 +142,7 @@ python3 scripts/stock_watcher.py watch-check --brand "Apple" --threshold-percent
 python3 scripts/stock_watcher.py watch-check --brand "Apple" --brand "MSFT"
 ```
 
-A newly watched symbol has no baseline until its first successful check. That check saves the latest completed regular-session close and exchange date without triggering an alert. Later checks compare against that baseline, using a strict threshold: exactly `+3%` or `-3%` does not flag, while values beyond those limits do. On a new comparable session, the baseline is updated to the latest close and session date. Pass `--brand` once per symbol to check multiple brands in one run. Each brand is handled independently: a failed fetch is reported without changing that symbol's `baseline_price` or `baseline_session_date`, and the remaining brands are still checked. Each failure produces a separate `reports/[ticker]_[YYYYMMDD]_error.md` report with the reason and an explicit not-checked warning.
+A newly watched symbol has no baseline until its first successful check. That check saves the latest completed regular-session close and exchange date without triggering an alert. Later checks compare against that baseline, using a strict threshold: exactly meeting the price change threshold does not flag, while values beyond those limits do (either positive or negative). On a new comparable session, the baseline is updated to the latest close and session date. Each brand is handled independently: a failed fetch is reported without changing that symbol's `baseline_price` or `baseline_session_date`, and the remaining brands are still checked. Each failure produces a separate `reports/[ticker]_[YYYYMMDD]_error.md` report with the reason and an explicit not-checked warning.
 
 ### Offline fixture walkthrough
 
@@ -200,12 +200,12 @@ VALUES (
 
 The fixture setup and expected results are:
 
-| Case | Baseline | Fixture close/session | Command condition | Expected result |
-|---|---:|---:|---|---|
-| Flagged move | `100.00` / `2024-01-10` | `104.00` / `2024-01-12` | `AAPL`, default threshold 3% | Alert `yes`, signed `+4.00%`, baseline becomes `104.00` / `2024-01-12` |
-| Exact boundary | `100.00` / `2024-01-11` | `103.00` / `2024-01-12` | `MSFT`, default threshold 3% | Alert `no`, signed `+3.00%`, baseline becomes `103.00` / `2024-01-12` |
-| Repeated session | `103.00` / `2024-01-12` | `103.00` / `2024-01-12` | `REPEAT` | No alert, baseline remains `103.00` / `2024-01-12`, no duplicate snapshot |
-| Partial failure | `100.00` / `2024-01-10` | unavailable | `UNAVAILABLE` + `AAPL` | UNAVAILABLE is warned/reported, its baseline is preserved, AAPL still proceeds |
+| Case             |                Baseline |   Fixture close/session | Command condition            | Expected result                                                                |
+| ---------------- | ----------------------: | ----------------------: | ---------------------------- | ------------------------------------------------------------------------------ |
+| Flagged move     | `100.00` / `2024-01-10` | `104.00` / `2024-01-12` | `AAPL`, default threshold 3% | Alert `yes`, signed `+4.00%`, baseline becomes `104.00` / `2024-01-12`         |
+| Exact boundary   | `100.00` / `2024-01-11` | `103.00` / `2024-01-12` | `MSFT`, default threshold 3% | Alert `no`, signed `+3.00%`, baseline becomes `103.00` / `2024-01-12`          |
+| Repeated session | `103.00` / `2024-01-12` | `103.00` / `2024-01-12` | `REPEAT`                     | No alert, baseline remains `103.00` / `2024-01-12`, no duplicate snapshot      |
+| Partial failure  | `100.00` / `2024-01-10` |             unavailable | `UNAVAILABLE` + `AAPL`       | UNAVAILABLE is warned/reported, its baseline is preserved, AAPL still proceeds |
 
 #### Commands and Expected Outcomes
 
