@@ -65,12 +65,11 @@ CREATE TABLE IF NOT EXISTS news_items (
 CREATE TABLE IF NOT EXISTS watched_symbols (
     watch_id INTEGER PRIMARY KEY AUTOINCREMENT,
     company_id INTEGER NOT NULL,
-    ticker TEXT NOT NULL,
     added_at TEXT NOT NULL,
     active INTEGER NOT NULL DEFAULT 1,
     baseline_price REAL,
     baseline_session_date TEXT,
-    UNIQUE(ticker),
+    UNIQUE(company_id),
     FOREIGN KEY (company_id) REFERENCES companies(company_id)
 );
 """
@@ -127,6 +126,42 @@ def initialize_project(project_root: Path | None = None) -> Path:
                 "NOT NULL DEFAULT 'unadjusted' "
                 "CHECK (price_basis IN ('split-adjusted', 'unadjusted'))"
             )
+
+        watch_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(watched_symbols)")
+        }
+        if "ticker" in watch_columns:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute(
+                "ALTER TABLE watched_symbols RENAME TO watched_symbols_legacy"
+            )
+            connection.execute(
+                """
+                CREATE TABLE watched_symbols (
+                    watch_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    company_id INTEGER NOT NULL,
+                    added_at TEXT NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    baseline_price REAL,
+                    baseline_session_date TEXT,
+                    UNIQUE(company_id),
+                    FOREIGN KEY (company_id) REFERENCES companies(company_id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO watched_symbols (
+                    company_id, added_at, active,
+                    baseline_price, baseline_session_date
+                )
+                SELECT company_id, added_at, active,
+                       baseline_price, baseline_session_date
+                FROM watched_symbols_legacy
+                """
+            )
+            connection.execute("DROP TABLE watched_symbols_legacy")
+            connection.execute("PRAGMA foreign_keys = ON")
 
         watch_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(watched_symbols)")
@@ -749,22 +784,24 @@ def add_watched_symbol(quote: dict, confirmed_ticker: str, database_path: Path) 
             "SELECT company_id FROM companies WHERE ticker = ?", (resolved_ticker,)
         ).fetchone()[0]
         connection.execute(
-            "INSERT INTO watched_symbols (company_id, ticker, added_at, active) "
-            "VALUES (?, ?, ?, 1) "
-            "ON CONFLICT(ticker) DO UPDATE SET "
-            "company_id = excluded.company_id, active = 1",
-            (company_id, resolved_ticker, captured_at),
+            "INSERT INTO watched_symbols (company_id, added_at, active) "
+            "VALUES (?, ?, 1) "
+            "ON CONFLICT(company_id) DO UPDATE SET "
+            "active = 1",
+            (company_id, captured_at),
         )
         row = connection.execute(
             """
-            SELECT watch_id, ticker, added_at, active
-            FROM watched_symbols WHERE ticker = ?
+            SELECT w.watch_id, c.ticker, w.added_at, w.active
+            FROM watched_symbols w
+            JOIN companies c ON c.company_id = w.company_id
+            WHERE w.company_id = ?
             """,
-            (resolved_ticker,),
+            (company_id,),
         ).fetchone()
     return {
         "watch_id": row[0],
-        "ticker": row[1],
+        "ticker": resolved_ticker,
         "added_at": row[2],
         "active": bool(row[3]),
         "company": quote["company"],
@@ -1021,9 +1058,10 @@ def check_watched_symbol(resolved: dict, threshold_percent: float, database_path
     with closing(sqlite3.connect(database_path)) as connection:
         row = connection.execute(
             """
-            SELECT baseline_price, baseline_session_date
-            FROM watched_symbols
-            WHERE ticker = ? AND active = 1
+            SELECT w.baseline_price, w.baseline_session_date
+            FROM watched_symbols w
+            JOIN companies c ON c.company_id = w.company_id
+            WHERE c.ticker = ? AND w.active = 1
             """,
             (ticker,),
         ).fetchone()
@@ -1048,7 +1086,9 @@ def check_watched_symbol(resolved: dict, threshold_percent: float, database_path
                 """
                 UPDATE watched_symbols
                 SET baseline_price = ?, baseline_session_date = ?
-                WHERE ticker = ?
+                WHERE company_id = (
+                    SELECT company_id FROM companies WHERE ticker = ?
+                )
                 """,
                 (new_price, new_session_date, ticker),
             )
@@ -1105,7 +1145,9 @@ def check_watched_symbol(resolved: dict, threshold_percent: float, database_path
                 """
                 UPDATE watched_symbols
                 SET baseline_price = ?, baseline_session_date = ?
-                WHERE ticker = ?
+                WHERE company_id = (
+                    SELECT company_id FROM companies WHERE ticker = ?
+                )
                 """,
                 (new_price, new_session_date, ticker),
             )

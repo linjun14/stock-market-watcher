@@ -200,12 +200,12 @@ VALUES (
 
 The fixture setup and expected results are:
 
-| Case             |                Baseline |   Fixture close/session | Command condition            | Expected result                                                                |
-| ---------------- | ----------------------: | ----------------------: | ---------------------------- | ------------------------------------------------------------------------------ |
-| Flagged move     | `100.00` / `2024-01-10` | `104.00` / `2024-01-12` | `AAPL`, default threshold 3% | Alert `yes`, signed `+4.00%`, baseline becomes `104.00` / `2024-01-12`         |
-| Exact boundary   | `100.00` / `2024-01-11` | `103.00` / `2024-01-12` | `MSFT`, default threshold 3% | Alert `no`, signed `+3.00%`, baseline becomes `103.00` / `2024-01-12`          |
-| Repeated session | `103.00` / `2024-01-12` | `103.00` / `2024-01-12` | `REPEAT`                     | No alert, baseline remains `103.00` / `2024-01-12`, no duplicate snapshot      |
-| Partial failure  | `100.00` / `2024-01-10` |             unavailable | `UNAVAILABLE` + `AAPL`       | UNAVAILABLE is warned/reported, its baseline is preserved, AAPL still proceeds |
+| Case                           |                Baseline |   Fixture close/session | Command condition            | Expected result                                                                |
+| ------------------------------ | ----------------------: | ----------------------: | ---------------------------- | ------------------------------------------------------------------------------ |
+| Flagged move                   | `100.00` / `2024-01-10` | `104.00` / `2024-01-12` | `AAPL`, default threshold 3% | Alert `yes`, signed `+4.00%`, baseline becomes `104.00` / `2024-01-12`         |
+| Exact boundary                 | `100.00` / `2024-01-11` | `103.00` / `2024-01-12` | `MSFT`, default threshold 3% | Alert `no`, signed `+3.00%`, baseline becomes `103.00` / `2024-01-12`          |
+| Repeated weekend/session check | `103.00` / `2024-01-12` | `103.00` / `2024-01-12` | `REPEAT`                     | No alert, baseline remains `103.00` / `2024-01-12`, no duplicate snapshot      |
+| Partial failure                | `100.00` / `2024-01-10` |             unavailable | `UNAVAILABLE` + `AAPL`       | UNAVAILABLE is warned/reported, its baseline is preserved, AAPL still proceeds |
 
 #### Commands and Expected Outcomes
 
@@ -252,5 +252,5 @@ Expected: no Yahoo request; a dated `TREND_YYYYMMDD.md` report is written, with 
 Verify watchlist state with SQLite:
 
 ```bash
-python -c "import sqlite3; c=sqlite3.connect('.state/stock_market_watcher.db'); print(*c.execute('SELECT ticker, baseline_price, baseline_session_date FROM watched_symbols ORDER BY ticker'), sep='\\n')"
+python -c "import sqlite3; c=sqlite3.connect('.state/stock_market_watcher.db'); print(*c.execute('SELECT co.ticker, w.baseline_price, w.baseline_session_date FROM watched_symbols w JOIN companies co ON co.company_id=w.company_id ORDER BY co.ticker'), sep='\\n')"
 ```
