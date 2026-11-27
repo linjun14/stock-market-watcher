@@ -103,8 +103,6 @@ Define these tables in `.state/stock_market_watcher.db`:
 - `news_items(news_id, snapshot_id, published_at, title, url, summary)`
 - `watched_symbols(watch_id, company_id, added_at, active, baseline_price, baseline_session_date)`
 
-Each `snapshots` row represents one price observation. `exchange_session_date` is the exchange-local calendar date on which the regular session closed; `captured_at` is the UTC timestamp when the script retrieved and stored the snapshot. `observed_at` retains the provider's source timestamp for compatibility and traceability. On weekends, the latest session date will normally be the previous Friday, while `captured_at` records the actual weekend retrieval time. Existing databases are migrated by deriving the new session-date field from their stored provider timestamp.
-
 ## Output
 
 - SQLite database: `.state/stock_market_watcher.db` for timestamped stock observations and watch registrations. Create `.state/` if it does not exist.
